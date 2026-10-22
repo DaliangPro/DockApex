@@ -1,0 +1,12 @@
+# 构建产物
+build/
+.build/
+prototypes/*/build/
+prototypes/*/logs/
+build-group-entry-check
+
+# 本机数据与备份：含分组、固定项和诊断，不入库
+Data/
+Backups/
+
+.DS_Store
