@@ -6,7 +6,7 @@
 
 [中文](README.md)
 
-> This is a personal project, tested only on the author's Apple Silicon Mac (macOS 27.0.1, two displays). Its interface is in Chinese; quoted labels below are translations. It relies on several private system interfaces and changes your system Dock settings, so it may stop working after a macOS update. Please read [Caveats](#caveats) before using it.
+The interface is in Chinese; quoted labels below are translations.
 
 ## Why
 
