@@ -778,8 +778,9 @@ enum ShadowDockGeometry {
         return casters
     }
 
-    /// 系统 Dock 主窗口所在的屏（藏着时读不到辅助功能外框，窗口也标为不在屏上，但位置仍指向所在屏）。
-    static func dockWindowScreen() -> NSScreen? {
+    /// 系统 Dock 主窗口的中心（AppKit 坐标；藏着时读不到辅助功能外框，窗口也标为不在屏上，但位置仍指向所在屏）。
+    /// 要取全系统窗口列表，负载高时上百毫秒（10-23 卡顿栈里在主线程 13 次共约 2.2 秒），调用方放在后台线程。
+    static func dockWindowCenter() -> CGPoint? {
         guard let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return nil }
         let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
         let primaryHeight = CGDisplayBounds(CGMainDisplayID()).height
@@ -787,10 +788,14 @@ enum ShadowDockGeometry {
             && (window[kCGWindowLayer as String] as? Int) == dockLevel {
             guard let bounds = window[kCGWindowBounds as String] as? [String: Any],
                   let cg = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { continue }
-            let center = CGPoint(x: cg.midX, y: primaryHeight - cg.midY)
-            return NSScreen.screens.first { $0.frame.contains(center) }
+            return CGPoint(x: cg.midX, y: primaryHeight - cg.midY)
         }
         return nil
+    }
+
+    @MainActor static func screen(containing point: CGPoint?) -> NSScreen? {
+        guard let point else { return nil }
+        return NSScreen.screens.first { $0.frame.contains(point) }
     }
 
     static func orientation() -> DockPosition {

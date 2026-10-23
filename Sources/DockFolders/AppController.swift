@@ -45,10 +45,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var status = "就绪：拖到图标边缘排序；拖到另一图标中央，出现预览后松开建组。"
     private let finderPath = "/System/Library/CoreServices/Finder.app"
     private let installedApplications = InstalledApplicationsMonitor()
-    /// 引用的应用第一次发现不在原处的时间。更新程序替换应用包时路径会短暂消失，过了宽限期仍不在才处理。
+    /// 引用的应用第一次发现不在原处的时间。更新程序替换应用包时路径会短暂消失：过了短宽限才去找装到别处的同一应用，
+    /// 过了移除宽限仍不在才当作卸载。pkg 安装、大型更新可能先删旧包、几分钟后才放新包，5 秒就删会丢掉分组成员和固定位置。
     private var missingApplications: [String: TimeInterval] = [:]
     private var applicationCheck: DispatchWorkItem?
     private static let missingApplicationGrace: TimeInterval = 5
+    private static let missingApplicationRemoval: TimeInterval = 600
     private var isEnding = false
     private var hasEnteredDock = false
     private var terminationTask: Task<Void, Never>?
@@ -66,6 +68,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     })
     private var relocatingHiddenDock = false
     private var hiddenDockAlignment: DispatchWorkItem?
+    /// 最近一次对齐量过的布局，以及这个布局下量过的 图标尺寸 → 废纸篓横向差。布局不变就不再对齐；
+    /// 量过且不比现在准的尺寸不再回去：尺寸只能取整数，理想值落在两个整数之间时会在两边来回改（10-23 实测累计 1069 次）。
+    private var hiddenDockAlignedLayout = ""
+    private var hiddenDockErrors: [Double: Double] = [:]
     /// 对齐时最近一次量到的隐藏系统 Dock（仅诊断用；诊断随每次刷新写出，不能在主线程现读辅助功能）。
     private var hiddenDockSummary = ""
     private var lastRuntimeDiagnostics: Data?
@@ -418,6 +424,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             forName: Notification.Name("io.daliang.dockfolders.sweep-benchmark"), object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.bar.runSweepBenchmark(duration: 3) }
         })
+        // 分组图标是按外观画好的位图，切换深浅色后重新取一次（通知早于外观生效，稍等再刷新）。
+        runtimeObservers.append(DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("AppleInterfaceThemeChangedNotification"), object: nil, queue: .main) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.refreshBar() }
+        })
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification,
                      NSWorkspace.didActivateApplicationNotification, NSWorkspace.didHideApplicationNotification,
                      NSWorkspace.didUnhideApplicationNotification, NSWorkspace.activeSpaceDidChangeNotification,
@@ -573,9 +584,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 推之前还要放开目标屏的边缘拦截、交还预留区：我们登记在目标屏的预留区会让系统认定 Dock 已在那块屏，
     /// 推边不再换屏（实测登记后推不动、撤掉一推就过去）。推完恢复。
     private func relocateHiddenDock(attempt: Int = 1) {
-        guard hasEnteredDock, nativeDock.isActive, nativeDock.shadow == nil, let store, let uuid = bar.activeDisplayUUID,
+        // 查系统 Dock 在哪块屏要取全系统窗口列表，放到后台线程，取到后回主线程接着判断。
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let center = ShadowDockGeometry.dockWindowCenter()
+            await MainActor.run { [weak self] in self?.relocateHiddenDock(attempt: attempt, dockCenter: center) }
+        }
+    }
+
+    private func relocateHiddenDock(attempt: Int, dockCenter: CGPoint?) {
+        guard hasEnteredDock, nativeDock.isActive, nativeDock.shadow == nil, !relocatingHiddenDock, let store, let uuid = bar.activeDisplayUUID,
               let target = NSScreen.screens.first(where: { DockDisplayDescriptor.uuid(for: $0) == uuid }),
-              let current = ShadowDockGeometry.dockWindowScreen() else { return }
+              let current = ShadowDockGeometry.screen(containing: dockCenter) else { return }
         guard current != target else { alignHiddenDock(); return }
         guard NSEvent.pressedMouseButtons == 0,
               CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .mouseMoved) > 1 else {
@@ -609,17 +628,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 CoreDockAutoHide.set(true)
                 finish()
-                let moved = ShadowDockGeometry.dockWindowScreen() == target
-                if !moved, attempt < 3 {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.relocateHiddenDock(attempt: attempt + 1) }
-                    return
+                Task.detached(priority: .userInitiated) { [weak self] in
+                    let center = ShadowDockGeometry.dockWindowCenter()
+                    await MainActor.run { [weak self] in self?.finishHiddenDockRelocation(attempt: attempt, targetUUID: uuid, dockCenter: center) }
                 }
-                self?.log?.record(moved ? "隐藏的系统 Dock 已挪到应用栏所在屏（第 \(attempt) 次），最小化会缩向这里。"
-                                        : "隐藏的系统 Dock 试了 \(attempt) 次仍未挪到应用栏所在屏，最小化会缩向它所在的屏。")
-                // 等收起动画走完再对齐，免得露着的系统 Dock 在收起途中跟着变小。
-                if moved { DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.alignHiddenDock() } }
             }
         }
+    }
+
+    private func finishHiddenDockRelocation(attempt: Int, targetUUID: String, dockCenter: CGPoint?) {
+        let moved = ShadowDockGeometry.screen(containing: dockCenter).flatMap { DockDisplayDescriptor.uuid(for: $0) } == targetUUID
+        if !moved, attempt < 3 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.relocateHiddenDock(attempt: attempt + 1) }
+            return
+        }
+        log?.record(moved ? "隐藏的系统 Dock 已挪到应用栏所在屏（第 \(attempt) 次），最小化会缩向这里。"
+                          : "隐藏的系统 Dock 试了 \(attempt) 次仍未挪到应用栏所在屏，最小化会缩向它所在的屏。")
+        // 等收起动画走完再对齐，免得露着的系统 Dock 在收起途中跟着变小。
+        if moved { DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.alignHiddenDock() } }
     }
 
     /// 插件画出新图标：清掉该 App 与分组的图标缓存，合并到下一轮刷新应用栏与展开的分组。
@@ -632,9 +658,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: work)
     }
 
-    /// 应用栏或运行中 App 变化后合并成 1 秒后对齐一次。
+    /// 决定两个废纸篓位置的布局：应用栏条目（含最小化窗口、文件）、图标尺寸、运行中 App（系统 Dock 里都有）和所在屏。
+    private var hiddenDockLayout: String {
+        ([bar.activeDisplayUUID ?? "", String(store?.configuration.options?.iconSize ?? 0)] + barItemIDs
+            + ShelfRunningApplications.shared.regularReferences.map(\.path).sorted()).joined(separator: "\n")
+    }
+
+    /// 应用栏或运行中 App 变化后合并成 1 秒后对齐一次；布局没变（如 10 秒定时刷新）就不再对齐。
     private func scheduleHiddenDockAlignment() {
-        guard hasEnteredDock, nativeDock.shadow == nil else { return }
+        guard hasEnteredDock, nativeDock.shadow == nil, hiddenDockLayout != hiddenDockAlignedLayout else { return }
         hiddenDockAlignment?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.alignHiddenDock() }
         hiddenDockAlignment = work
@@ -648,21 +680,26 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func alignHiddenDock(round: Int = 0) {
         guard hasEnteredDock, nativeDock.shadow == nil, !relocatingHiddenDock, let store, store.configuration.position == .bottom,
               let uuid = bar.activeDisplayUUID,
-              let target = NSScreen.screens.first(where: { DockDisplayDescriptor.uuid(for: $0) == uuid }),
-              ShadowDockGeometry.dockWindowScreen() == target,
               let ours = bar.restingRect(for: "system:trash") else { return }
         Task.detached(priority: .utility) { [weak self] in
+            let center = ShadowDockGeometry.dockWindowCenter()
             guard let native = ShadowDockGeometry.readNativeDock(), let trash = native.tiles.last else { return }
             await MainActor.run { [weak self] in
+                // 系统 Dock 不在应用栏所在屏时不对齐（换屏成功后会再调用）。
                 guard let self, !self.relocatingHiddenDock, self.nativeDock.isActive, self.nativeDock.shadow == nil,
+                      ShadowDockGeometry.screen(containing: center).flatMap({ DockDisplayDescriptor.uuid(for: $0) }) == uuid,
                       let size = CoreDockTileSize.get() else { return }
                 self.hiddenDockSummary = String(format: "%@ 尺寸 %.0f 废纸篓 %.1f 应用栏废纸篓 %.1f",
                                                 NSStringFromRect(native.frame), size, trash.frame.midX, ours.midX)
                 let center = native.frame.midX
                 let wanted = ours.midX - center, actual = trash.frame.midX - center
                 guard wanted > 20, actual > 20 else { return }
+                let layout = self.hiddenDockLayout
+                if layout != self.hiddenDockAlignedLayout { self.hiddenDockAlignedLayout = layout; self.hiddenDockErrors = [:] }
+                self.hiddenDockErrors[size.rounded()] = actual - wanted
                 let next = min(max(((size + 2) * wanted / actual - 2).rounded(), 16), 128)
                 guard abs(next - size.rounded()) >= 1 else { return }
+                if let known = self.hiddenDockErrors[next], abs(known) >= abs(actual - wanted) { return }
                 do { try self.nativeDock.beginManaging("tilesize") } catch {
                     self.log?.record("未调整隐藏系统 Dock 的图标尺寸：\(error.localizedDescription)")
                     return
@@ -788,7 +825,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 for window in entry.snapshot.windows where window.isMinimized {
                     let id = "system:window:" + window.id
                     minimizedWindows[id] = (entry.application, window)
-                    display.append(DockDisplayItem(id: id, name: window.title, icon: minimizedWindowIcon(entry.application), isRunning: false, isGroup: false, section: .files, acceptsFileDrops: false))
+                    display.append(DockDisplayItem(id: id, name: window.title, icon: DockIconProvider.shared.minimizedWindowIcon(for: entry.application), isRunning: false, isGroup: false, section: .files, acceptsFileDrops: false))
                 }
             }
         }
@@ -937,7 +974,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let changes = next.updateApplications { applicationUpdate(for: $0, now: now) }
         let folders = referencedApplications.map { $0.appURL.deletingLastPathComponent().path }
         installedApplications.watch(Set(folders + ["/Applications", NSHomeDirectory() + "/Applications"]))
-        if !missingApplications.isEmpty { scheduleApplicationCheck(after: Self.missingApplicationGrace) }
+        // 按最近一个到期的宽限再核对，不在移除宽限内每 5 秒重读一遍。
+        if let due = missingApplications.values.map({ since -> TimeInterval in
+            let elapsed = now - since
+            return (elapsed < Self.missingApplicationGrace ? Self.missingApplicationGrace : Self.missingApplicationRemoval) - elapsed
+        }).min() { scheduleApplicationCheck(after: max(1, due)) }
         guard !changes.isEmpty else { refreshBar(); return }
         var removed: [String] = [], replaced: [String] = []
         for (old, change) in changes.sorted(by: { $0.key.path < $1.key.path }) {
@@ -971,8 +1012,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let since = missingApplications[app.path] ?? now
         missingApplications[app.path] = since
         guard now - since >= Self.missingApplicationGrace - 0.1 else { return .keep }
+        if let moved = installedCopy(of: app) { missingApplications[app.path] = nil; return .replace(moved) }
+        guard now - since >= Self.missingApplicationRemoval - 0.1 else { return .keep }
         missingApplications[app.path] = nil
-        if let moved = installedCopy(of: app) { return .replace(moved) }
         // 所在文件夹也不在（外接磁盘没接上、文件夹改了名）时不当作卸载，留着等它回来。
         return files.fileExists(atPath: app.appURL.deletingLastPathComponent().path) ? .remove : .keep
     }
@@ -1018,18 +1060,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func isTransientAppPath(_ path: String) -> Bool {
         path.hasPrefix("/tmp/") || path.hasPrefix("/private/tmp/")
-    }
-
-    private func minimizedWindowIcon(_ app: AppReference) -> NSImage {
-        NSImage(size: CGSize(width: 128, height: 128), flipped: false) { rect in
-            let frame = rect.insetBy(dx: 5, dy: 12)
-            NSColor.windowBackgroundColor.setFill(); NSBezierPath(roundedRect: frame, xRadius: 12, yRadius: 12).fill()
-            NSColor.separatorColor.setStroke(); NSBezierPath(roundedRect: frame, xRadius: 12, yRadius: 12).stroke()
-            NSColor.secondaryLabelColor.withAlphaComponent(0.18).setFill()
-            NSBezierPath(rect: CGRect(x: frame.minX + 1, y: frame.maxY - 18, width: frame.width - 2, height: 1)).fill()
-            ShelfAppActions.icon(app).draw(in: CGRect(x: 30, y: 22, width: 68, height: 68))
-            return true
-        }
     }
 
     private func minimizationTarget(path: String, windowID: String?, sourcePoint: CGPoint) -> CGRect? {
@@ -1093,14 +1123,49 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func removeItem(_ id: String) {
         var next = store.configuration
+        var message = "已从应用栏移除；文件和应用仍保留。"
         if next.files?.contains(where: { $0.id == id }) == true {
             next.files?.removeAll { $0.id == id }
         } else if let item = item(id) {
             if case .app(let app) = item, app.path == finderPath { return }
+            if case .group(let groupID) = item, let group = next.groups.first(where: { $0.id == groupID }) {
+                // 分组只存在于本应用的配置里，移除即删掉分组名和成员归组，不像文件夹那样还留在磁盘上，所以先确认。
+                guard confirmGroupRemoval(group) else { log.record("移除分组：已取消"); refreshBar(); return }
+                next.groups.removeAll { $0.id == groupID }; panel.hide()
+                message = "分组“\(group.name)”已移除；组内 App 未卸载，可用“撤销布局更改”恢复。"
+            }
             next.items.removeAll { $0.id == id }
-            if case .group(let groupID) = item { next.groups.removeAll { $0.id == groupID }; panel.hide() }
         } else { return }
-        apply(next, message: "已从应用栏移除；文件和应用仍保留。")
+        apply(next, message: message)
+    }
+
+    /// 与管理窗口的“解散分组”一致：回车是“取消”。
+    private func confirmGroupRemoval(_ group: AppGroup) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "移除分组“\(group.name)”？"
+        alert.informativeText = "分组和其中 \(group.apps.count) 个 App 的归组会被删除，App 本身不会被卸载。"
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "移除分组").hasDestructiveAction = true
+        return runConfirmation(alert, cancel: .alertFirstButtonReturn) == .alertSecondButtonReturn
+    }
+
+    /// 弹出确认框并能用回车、Esc 操作。本应用没有 Dock 图标，点应用栏不会激活它；NSApp.activate() 在 macOS 14 以后
+    /// 只是请求，前台 App 不让出就不生效（10-23 实测确认框弹出时本应用不在前台，回车和 Esc 都落到了别的 App）。
+    /// 与菜单浮层一样把确认框设成不激活也能拿键盘的面板，Esc 一律当作取消。
+    private func runConfirmation(_ alert: NSAlert, cancel: NSApplication.ModalResponse) -> NSApplication.ModalResponse {
+        alert.layout()
+        let window = alert.window
+        if let panel = window as? NSPanel { panel.styleMask.insert(.nonactivatingPanel); panel.becomesKeyOnlyIfNeeded = false }
+        let escape = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak window] event in
+            let handled = MainActor.assumeIsolated { () -> Bool in
+                guard event.keyCode == 53, let window, event.window === window else { return false }
+                NSApp.stopModal(withCode: cancel)
+                return true
+            }
+            return handled ? nil : event
+        }
+        defer { if let escape { NSEvent.removeMonitor(escape) } }
+        return alert.runModal()
     }
 
     private func promote(_ id: String, in configuration: inout ShelfConfiguration) {
@@ -1521,8 +1586,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.icon = NSImage(named: NSImage.trashFullName)
             alert.addButton(withTitle: "清倒废纸篓").hasDestructiveAction = true
             alert.addButton(withTitle: "取消").keyEquivalent = "\u{1b}"
-            NSApp.activate()
-            guard alert.runModal() == .alertFirstButtonReturn else { log.record("清倒废纸篓：已取消"); return }
+            guard runConfirmation(alert, cancel: .alertSecondButtonReturn) == .alertFirstButtonReturn else { log.record("清倒废纸篓：已取消"); return }
         }
         emptyingTrash = true
         log.record("清倒废纸篓：已请访达执行")
