@@ -7,10 +7,12 @@ import QuartzCore
 struct DockSurfaceInteractionChecks {
     @MainActor
     static func main() {
+        setvbuf(stdout, nil, _IONBF, 0)
         _ = NSApplication.shared
         NSApp.setActivationPolicy(.prohibited)
         var checks = 0
         func check(_ value: @autoclosure () -> Bool, _ reason: String) {
+            if !value() { print("未通过：\(reason)") }
             precondition(value(), reason)
             checks += 1
         }
@@ -26,19 +28,21 @@ struct DockSurfaceInteractionChecks {
         check(stationary.surface.subviews.compactMap { $0 as? DockMotionIcon }.count == 1, "渲染层应只剩一个分组图标")
         check(!stationary.panel.isVisible, "事件回归不能把测试面板显示到用户桌面")
 
-        let short = Fixture()
-        short.beginDrag()
-        short.wait(at: short.targetCenter, duration: 0.16)
-        short.release(at: short.targetCenter)
-        check(short.mergeCount == 0, "快速经过不能合并")
-        check(short.configuration.groups.isEmpty, "短停留不能生成分组模型")
+        // 10-19 起拖叠建组不再要求停留：慢速进入目标中央立即可松手建组，快速划过不算。
+        let fast = Fixture()
+        fast.beginDrag(to: fast.sourceStart(offset: 6))
+        let beyond = CGPoint(x: fast.targetCenter.x + 60, y: fast.targetCenter.y)
+        fast.sweep(to: beyond, step: 30, interval: 0.004)
+        fast.release(at: beyond)
+        check(fast.mergeCount == 0, "快速划过不能合并")
+        check(fast.configuration.groups.isEmpty, "快速划过不能生成分组模型")
 
-        let futureFrame = Fixture()
-        futureFrame.beginDrag()
-        futureFrame.advance(at: futureFrame.targetCenter, predictedFrameOffset: 2)
-        check(!futureFrame.hints.contains("松开创建分组"), "未来显示时间不能提前完成真实停留")
-        futureFrame.release(at: futureFrame.targetCenter)
-        check(futureFrame.mergeCount == 0, "输入松手不能继承未来帧伪造的停留")
+        let slow = Fixture()
+        slow.beginDrag(to: slow.sourceStart(offset: 6))
+        slow.sweep(to: slow.targetCenter, step: 2, interval: 0.02)
+        check(slow.hints.contains("松开创建分组"), "慢速进入中央应立即提示松开建组")
+        slow.release(at: slow.targetCenter)
+        check(slow.mergeCount == 1, "慢速进入中央不停留也能合并")
 
         let fastArrival = Fixture()
         let sourceFrame = fastArrival.icon(fastArrival.sourceID).frame
@@ -86,9 +90,9 @@ struct DockSurfaceInteractionChecks {
         stackIcon.mouseUp(with: stack.event(.leftMouseUp, at: stackPoint))
         check(stack.openCount == 1 && !stack.surface.needsContinuousFrames, "文件夹入口展开也不能触发应用启动弹跳")
 
-        let fixtures = [stationary, short, futureFrame, fastArrival, cancelled, edge, stack]
+        let fixtures = [stationary, fast, slow, fastArrival, cancelled, edge, stack]
         for fixture in fixtures { fixture.surface.cancelInteraction(); fixture.panel.orderOut(nil) }
-        print("通过：\(checks) 项自制 Dock 离屏鼠标事件检查。覆盖静止停留、运行状态刷新、真实单入口合并、短停留、未来帧时间、Esc、边缘排序、单击与文件夹无弹跳。未操作运行中的产品、系统设置、真实布局或用户窗口。")
+        print("通过：\(checks) 项自制 Dock 离屏鼠标事件检查。覆盖静止停留、运行状态刷新、真实单入口合并、快速划过不合并、慢速进入立即合并、Esc、边缘排序、单击与文件夹无弹跳。未操作运行中的产品、系统设置、真实布局或用户窗口。")
     }
 
     @MainActor
@@ -104,6 +108,7 @@ struct DockSurfaceInteractionChecks {
         var openCount = 0
         var hints = Set<String>()
         private var sourceView: DockMotionIcon?
+        private var lastDragPoint = CGPoint.zero
 
         init() {
             let a = AppReference(path: "/fixture/A.app", name: "示例 A", bundleIdentifier: "fixture.A")
@@ -162,10 +167,33 @@ struct DockSurfaceInteractionChecks {
             sourceView = view
             let origin = CGPoint(x: view.frame.midX, y: view.frame.midY)
             view.mouseDown(with: event(.leftMouseDown, at: origin))
-            view.mouseDragged(with: event(.leftMouseDragged, at: destination ?? targetCenter))
+            lastDragPoint = destination ?? targetCenter
+            view.mouseDragged(with: event(.leftMouseDragged, at: lastDragPoint))
         }
 
         func release(at point: CGPoint) { sourceView?.mouseUp(with: event(.leftMouseUp, at: point)) }
+
+        func sourceStart(offset: CGFloat) -> CGPoint {
+            let frame = icon(sourceID).frame
+            return CGPoint(x: frame.midX + offset, y: frame.midY)
+        }
+
+        /// 从当前拖动位置按固定步长、固定间隔（真实时间）移到目标点，每步都发拖动事件并推进一帧。
+        func sweep(to destination: CGPoint, step: CGFloat, interval: TimeInterval) {
+            guard let view = sourceView else { return }
+            var point = lastDragPoint
+            while hypot(destination.x - point.x, destination.y - point.y) > step {
+                let distance = hypot(destination.x - point.x, destination.y - point.y)
+                point.x += (destination.x - point.x) / distance * step
+                point.y += (destination.y - point.y) / distance * step
+                view.mouseDragged(with: event(.leftMouseDragged, at: point))
+                advance(at: point)
+                RunLoop.current.run(until: Date(timeIntervalSinceNow: interval))
+            }
+            view.mouseDragged(with: event(.leftMouseDragged, at: destination))
+            advance(at: destination)
+            lastDragPoint = destination
+        }
 
         func advance(at point: CGPoint, predictedFrameOffset: TimeInterval = 1.0 / 60) {
             _ = surface.advance(time: ProcessInfo.processInfo.systemUptime + predictedFrameOffset,

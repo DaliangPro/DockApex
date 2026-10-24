@@ -44,7 +44,7 @@ final class FileStackController: NSObject, NSTableViewDataSource, NSTableViewDel
         prefersKeyboardSelection = NSApp.currentEvent?.type == .keyDown
         if panel == nil { makePanel() }
         guard let panel else { return }
-        panel.title = "Dock 文件夹 · 文件夹：\(FileManager.default.displayName(atPath: directory.path))"
+        panel.title = "DockApex · 文件夹：\(FileManager.default.displayName(atPath: directory.path))"
         panel.setAccessibilityTitle(panel.title)
         heading?.stringValue = FileManager.default.displayName(atPath: directory.path)
         entries = []
@@ -70,7 +70,7 @@ final class FileStackController: NSObject, NSTableViewDataSource, NSTableViewDel
                 if event.window === self.panel { self.presentation?.finishOpeningForInteraction() }
                 if event.type == .keyDown, event.keyCode == 53 { self.hide(); return true }
                 if event.type != .keyDown, !self.isPresentingMenu, event.window !== self.panel,
-                   event.window?.title.hasPrefix("Dock 文件夹 · 应用栏") != true { self.hide(reason: "local-outside") }
+                   event.window?.title.hasPrefix("DockApex · 应用栏") != true { self.hide(reason: "local-outside") }
                 return false
             }
             return consumed ? nil : event

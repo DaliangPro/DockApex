@@ -25,9 +25,12 @@ final class NativeDockMenuMirror {
     static let shared = NativeDockMenuMirror()
     private var cache: [pid_t: (time: TimeInterval, content: NativeDockMenuMirrorContent)] = [:]
     private var busy = false
-    private let cover = ShadowPatch(title: "Dock 文件夹 · 原生菜单遮盖", level: NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue + 2))
+    private let cover = ShadowPatch(title: "DockApex · 原生菜单遮盖", level: NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue + 2))
     /// 补底位置（画面已带阴影，遮盖叠阴影时避开）；由应用控制器设置。
     static var patchFrame: (() -> CGRect?)?
+    /// 经典模式下藏着的系统 Dock 所在屏。它的格子在屏幕底边外，坐标可能落进下面接着的另一块屏，
+    /// 菜单却弹在 Dock 所在屏的底边上，遮盖按这块屏盖；影子模式下为 nil，按格子所在屏。
+    static var dockScreen: (() -> NSScreen?)?
     private(set) var lastTiming: [String: Int] = [:]
 
     func cached(for pid: pid_t) -> NativeDockMenuMirrorContent? {
@@ -36,7 +39,8 @@ final class NativeDockMenuMirror {
     }
 
     /// 读取后回调；失败或超时也回调，菜单照常显示常用项。
-    /// 经典模式下系统 Dock 藏着，打开它的菜单可能把它带出来，不读原生菜单。
+    /// 经典模式下只在藏着的系统 Dock 已挪到应用栏所在屏时启用（10-24 实测：打开它的菜单不会把它带出来，
+    /// 只有菜单在屏上出现约 20 毫秒，由遮盖盖住）。
     var enabled = true
 
     func prepare(_ app: AppReference, windowTitles: Set<String>, completion: @escaping @MainActor () -> Void) {
@@ -116,7 +120,7 @@ final class NativeDockMenuMirror {
     /// 原先是单帧截图：读菜单的一百多毫秒里画面冻住，截图又不带窗口阴影，看起来像整片闪一下、补底边缘露出来。
     /// 返回遮盖是否已经盖上。
     private func showCover(around tile: CGRect, windowTitles: Set<String>) async -> Bool {
-        guard let screen = NSScreen.screens.first(where: { $0.frame.intersects(tile) }) else { return false }
+        guard let screen = Self.dockScreen?() ?? NSScreen.screens.first(where: { $0.frame.intersects(tile) }) else { return false }
         let full = screen.frame
         // 原生菜单在格子上方水平居中展开，最高到菜单栏下方；宽度随最长的窗口标题变化，
         // 按 13 点字估算再留足余量，至少左右各 460 点。

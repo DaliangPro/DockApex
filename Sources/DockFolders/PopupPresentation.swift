@@ -5,10 +5,19 @@ import QuartzCore
 /// 不能只给 NSGlassEffectView 设置 cornerRadius：其内容与旧版材质仍可能画满矩形。
 @MainActor
 final class PopupSurfaceView: NSView {
+    /// 指向入口图标的小箭头（与右键菜单浮层一致）：所在边与箭尖位置（本视图坐标）。外框已含箭头那一条，内容排在其余部分。
+    struct Arrow: Equatable {
+        var edge: DockPosition
+        var tip: CGPoint
+    }
+    /// 宽度含两侧与面板边衔接的过渡曲线。
+    static let arrowSize = CGSize(width: 34, height: 10)
+
     let content: NSView
     private let motionSurface = NSView()
     private let clippedSurface = NSView()
     private var contentFrame = CGRect.zero
+    private var arrow: Arrow?
     private let material: NSView
     private let roundingMask = CAShapeLayer()
     private let radius: CGFloat
@@ -74,12 +83,64 @@ final class PopupSurfaceView: NSView {
         motionSurface.layer?.position = CGPoint(x: contentFrame.midX, y: contentFrame.midY)
         if clippedSurface.frame != motionSurface.bounds { clippedSurface.frame = motionSurface.bounds }
         if material.frame != clippedSurface.bounds { material.frame = clippedSurface.bounds }
-        if content.frame != material.bounds {
-            content.frame = material.bounds
+        let body = bodyRect(in: material.bounds)
+        if content.frame != body {
+            content.frame = body
             content.needsLayout = true
         }
         updateMask()
         CATransaction.commit()
+    }
+
+    /// 外框去掉箭头那一条后的面板主体。
+    private func bodyRect(in bounds: CGRect) -> CGRect {
+        guard let arrow else { return bounds }
+        let height = Self.arrowSize.height
+        switch arrow.edge {
+        case .bottom: return CGRect(x: bounds.minX, y: bounds.minY + height, width: bounds.width, height: bounds.height - height)
+        case .left: return CGRect(x: bounds.minX + height, y: bounds.minY, width: bounds.width - height, height: bounds.height)
+        case .right: return CGRect(x: bounds.minX, y: bounds.minY, width: bounds.width - height, height: bounds.height)
+        }
+    }
+
+    /// 圆角主体连同箭头画成一条轮廓（玻璃遮罩与阴影共用）。箭头贴着入口那一边，
+    /// 位置跟着入口中心走，但不进圆角范围（面板被屏幕边缘挡住、挪开时箭头仍尽量对准入口）。
+    private func outline(in bounds: CGRect) -> CGPath {
+        let body = bodyRect(in: bounds)
+        guard let arrow, body.width > radius * 2, body.height > radius * 2 else {
+            return CGPath(roundedRect: body, cornerWidth: radius, cornerHeight: radius, transform: nil)
+        }
+        let half = Self.arrowSize.width / 2, depth = Self.arrowSize.height, r = radius
+        let tip = CGPoint(x: arrow.tip.x - contentFrame.minX, y: arrow.tip.y - contentFrame.minY)
+        let path = CGMutablePath()
+        /// 箭头两侧各一段三次曲线：起点与面板边相切（与边缘圆滑衔接），到箭尖时水平收拢（箭尖成圆弧），没有折角。
+        /// point 把“沿边位置、离边深度”换算成坐标；sign 是轮廓沿这条边前进的方向。
+        func notch(center: CGFloat, sign: CGFloat, _ point: (CGFloat, CGFloat) -> CGPoint) {
+            path.addLine(to: point(center - sign * half, 0))
+            path.addCurve(to: point(center, depth), control1: point(center - sign * half * 0.52, 0),
+                          control2: point(center - sign * half * 0.34, depth))
+            path.addCurve(to: point(center + sign * half, 0), control1: point(center + sign * half * 0.34, depth),
+                          control2: point(center + sign * half * 0.52, 0))
+        }
+        path.move(to: CGPoint(x: body.minX + r, y: body.minY))
+        if arrow.edge == .bottom {
+            let x = min(max(tip.x, body.minX + r + half), body.maxX - r - half)
+            notch(center: x, sign: 1) { CGPoint(x: $0, y: body.minY - $1) }
+        }
+        path.addArc(tangent1End: CGPoint(x: body.maxX, y: body.minY), tangent2End: CGPoint(x: body.maxX, y: body.maxY), radius: r)
+        if arrow.edge == .right {
+            let y = min(max(tip.y, body.minY + r + half), body.maxY - r - half)
+            notch(center: y, sign: 1) { CGPoint(x: body.maxX + $1, y: $0) }
+        }
+        path.addArc(tangent1End: CGPoint(x: body.maxX, y: body.maxY), tangent2End: CGPoint(x: body.minX, y: body.maxY), radius: r)
+        path.addArc(tangent1End: CGPoint(x: body.minX, y: body.maxY), tangent2End: CGPoint(x: body.minX, y: body.minY), radius: r)
+        if arrow.edge == .left {
+            let y = min(max(tip.y, body.minY + r + half), body.maxY - r - half)
+            notch(center: y, sign: -1) { CGPoint(x: body.minX - $1, y: $0) }
+        }
+        path.addArc(tangent1End: CGPoint(x: body.minX, y: body.minY), tangent2End: CGPoint(x: body.maxX, y: body.minY), radius: r)
+        path.closeSubpath()
+        return path
     }
 
     override func viewDidChangeBackingProperties() {
@@ -94,8 +155,7 @@ final class PopupSurfaceView: NSView {
         clippedSurface.layer?.contentsScale = scale
         roundingMask.contentsScale = scale
         roundingMask.frame = clippedSurface.bounds
-        roundingMask.path = CGPath(roundedRect: clippedSurface.bounds,
-                                   cornerWidth: radius, cornerHeight: radius, transform: nil)
+        roundingMask.path = outline(in: clippedSurface.bounds)
         motionSurface.layer?.shadowPath = roundingMask.path
     }
 
@@ -103,8 +163,9 @@ final class PopupSurfaceView: NSView {
         contentFrame.isEmpty ? nil : window.convertToScreen(convert(contentFrame, to: nil))
     }
 
-    func configureContent(frame: CGRect, expandedCanvas: Bool) {
+    func configureContent(frame: CGRect, expandedCanvas: Bool, arrow: Arrow? = nil) {
         contentFrame = frame
+        self.arrow = arrow
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         motionSurface.layer?.shadowOpacity = expandedCanvas ? 0.20 : 0
@@ -155,18 +216,28 @@ final class PopupSurfaceView: NSView {
                 self.pendingModelCommit = false
             }
             animationStartObserver = observer
-            let motion = CABasicAnimation(keyPath: "transform")
-            motion.fromValue = NSValue(caTransform3D: CATransform3DMakeAffineTransform(previousTransform))
-            motion.toValue = NSValue(caTransform3D: target)
-            motion.duration = duration
-            motion.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            // 与系统弹出框（右键菜单、窗口预览）同一条曲线。10-23 逐帧采样系统弹出框窗口：从箭尖长出，透明度与缩放同步；
+            // 展开约 0.20 秒到位、0.24 秒冲过约 1.7%、0.47 秒回稳（弹簧，阻尼比约 0.79、固有频率约 21.5）；
+            // 收起 0.26 秒缩回箭尖、不回弹，形状与系统默认缓动曲线（0.25, 0.1, 0.25, 1）吻合。
+            let opening = opacity > previousOpacity
+            func curve(_ keyPath: String, from: Any, to: Any) -> CABasicAnimation {
+                let animation: CABasicAnimation
+                if opening {
+                    let spring = CASpringAnimation(keyPath: keyPath)
+                    spring.mass = 1; spring.stiffness = 462; spring.damping = 34
+                    spring.duration = spring.settlingDuration
+                    animation = spring
+                } else {
+                    animation = CABasicAnimation(keyPath: keyPath)
+                    animation.duration = 0.26
+                    animation.timingFunction = CAMediaTimingFunction(name: .default)
+                }
+                animation.fromValue = from; animation.toValue = to
+                return animation
+            }
+            let motion = curve("transform", from: NSValue(caTransform3D: CATransform3DMakeAffineTransform(previousTransform)), to: NSValue(caTransform3D: target))
             motion.delegate = observer
-            let fade = CAKeyframeAnimation(keyPath: "opacity")
-            // 一开始就能看到来源处的体积；展开早段完成淡入，收回末段才淡出。
-            fade.values = opacity > previousOpacity ? [previousOpacity, opacity, opacity] : [previousOpacity, previousOpacity, opacity]
-            fade.keyTimes = opacity > previousOpacity ? [0, 0.18, 1] : [0, 0.85, 1]
-            fade.duration = duration
-            fade.calculationMode = .linear
+            let fade = curve("opacity", from: previousOpacity, to: opacity)
             layer.add(motion, forKey: "popup-transform")
             layer.add(fade, forKey: "popup-opacity")
         }
@@ -224,10 +295,39 @@ final class PopupPresentation {
         panel.animationBehavior = .none
     }
 
-    func setLayout(frame: CGRect, anchor: CGRect, position: DockPosition, animated: Bool = true) {
+    /// 外框：面板主体朝入口一侧多出箭头那一条（主体离入口 12 点，箭尖离入口约 2 点）。
+    private func outerFrame(for body: CGRect) -> CGRect {
+        let depth = PopupSurfaceView.arrowSize.height
+        switch position {
+        case .bottom: return CGRect(x: body.minX, y: body.minY - depth, width: body.width, height: body.height + depth)
+        case .left: return CGRect(x: body.minX - depth, y: body.minY, width: body.width + depth, height: body.height)
+        case .right: return CGRect(x: body.minX, y: body.minY, width: body.width + depth, height: body.height)
+        }
+    }
+
+    /// 展开、收起的起点：箭尖处的一个小点（与系统弹出框一样从箭尖长出、缩回箭尖）。
+    /// 箭头横向位置与 PopupSurfaceView.outline 一致：跟着入口中心，但不进圆角范围。
+    private func arrowTip(of frame: CGRect) -> CGRect {
+        let inset = 24 + PopupSurfaceView.arrowSize.width / 2
+        let point: CGPoint
+        switch position {
+        case .bottom: point = CGPoint(x: min(max(anchor.midX, frame.minX + inset), frame.maxX - inset), y: frame.minY)
+        case .left: point = CGPoint(x: frame.minX, y: min(max(anchor.midY, frame.minY + inset), frame.maxY - inset))
+        case .right: point = CGPoint(x: frame.maxX, y: min(max(anchor.midY, frame.minY + inset), frame.maxY - inset))
+        }
+        return CGRect(x: point.x - 1, y: point.y - 1, width: 2, height: 2)
+    }
+
+    /// 箭尖对准入口中心，换算到窗口坐标。
+    private func arrow(inWindow window: CGRect) -> PopupSurfaceView.Arrow {
+        PopupSurfaceView.Arrow(edge: position, tip: CGPoint(x: anchor.midX - window.minX, y: anchor.midY - window.minY))
+    }
+
+    func setLayout(frame body: CGRect, anchor: CGRect, position: DockPosition, animated: Bool = true) {
         self.anchor = anchor; self.position = position
+        let frame = outerFrame(for: body)
         guard let panel, let surface,
-              let next = PopupMorphGeometry(sourceFrame: anchor, targetFrame: frame,
+              let next = PopupMorphGeometry(sourceFrame: arrowTip(of: frame), targetFrame: frame,
                   backingScale: panel.backingScaleFactor)
                 ?? PopupMorphGeometry(sourceFrame: frame, targetFrame: frame,
                     backingScale: panel.backingScaleFactor) else { return }
@@ -238,7 +338,7 @@ final class PopupPresentation {
             preparedFromSource = true
             applyCanvas(expanded: !reduceMotion)
             surface.setPresentation(transform: reduceMotion ? .identity : next.transform(at: 0),
-                                    opacity: reduceMotion ? 0 : 0.78, duration: 0)
+                                    opacity: 0, duration: 0)
         } else if changed, wantsVisible {
             // 内容或入口变动只重新拟合一次；正常开合不经过这条布局路径。
             trace?.layoutRetargets += 1
@@ -254,7 +354,7 @@ final class PopupPresentation {
             generation &+= 1
             applyCanvas(expanded: !reduceMotion)
             surface.setPresentation(transform: reduceMotion ? .identity : next.transform(at: 0),
-                                    opacity: reduceMotion ? 0 : 0.78, duration: 0)
+                                    opacity: 0, duration: 0)
             targetProgress = 0
             preparedFromSource = true
             // 只有紧接着 present() 才是“改开另一组”；否则立即收起，不留下来源大小的残影。
@@ -269,11 +369,13 @@ final class PopupPresentation {
 
     /// 展开状态下改尺寸（拖入时加行、拖离时收回）：外壳从旧尺寸平滑过渡到新尺寸，不一步跳过去。
     /// 窗口先扩到新旧并集，逐帧调整内容框，结束后收紧到新尺寸。开合动画进行中时退回普通布局。
-    func resizeVisible(to frame: CGRect, anchor: CGRect, position: DockPosition) {
+    func resizeVisible(to body: CGRect, anchor: CGRect, position: DockPosition) {
+        self.position = position
+        let frame = outerFrame(for: body)
         guard let panel, let surface, panel.isVisible, wantsVisible, targetProgress == 1, !usesExpandedCanvas,
               let current = geometry?.targetFrame, current != frame,
-              let next = PopupMorphGeometry(sourceFrame: anchor, targetFrame: frame, backingScale: panel.backingScaleFactor) else {
-            setLayout(frame: frame, anchor: anchor, position: position)
+              let next = PopupMorphGeometry(sourceFrame: arrowTip(of: frame), targetFrame: frame, backingScale: panel.backingScaleFactor) else {
+            setLayout(frame: body, anchor: anchor, position: position)
             return
         }
         resizeTimer?.invalidate()
@@ -284,7 +386,7 @@ final class PopupPresentation {
         geometry = next
         panel.hasShadow = false
         if panel.frame != canvas { panel.setFrame(canvas, display: false) }
-        surface.configureContent(frame: from.offsetBy(dx: -canvas.minX, dy: -canvas.minY), expandedCanvas: true)
+        surface.configureContent(frame: from.offsetBy(dx: -canvas.minX, dy: -canvas.minY), expandedCanvas: true, arrow: arrow(inWindow: canvas))
         surface.layoutSubtreeIfNeeded()
         resizeState = (from, frame, canvas, ProcessInfo.processInfo.systemUptime, reduceMotion ? 0 : 0.26, generation)
         let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] _ in MainActor.assumeIsolated { self?.stepResize() } }
@@ -302,7 +404,8 @@ final class PopupPresentation {
         let from = state.from, to = state.to
         let rect = CGRect(x: from.minX + (to.minX - from.minX) * eased, y: from.minY + (to.minY - from.minY) * eased,
                           width: from.width + (to.width - from.width) * eased, height: from.height + (to.height - from.height) * eased)
-        surface.configureContent(frame: rect.offsetBy(dx: -state.canvas.minX, dy: -state.canvas.minY), expandedCanvas: true)
+        surface.configureContent(frame: rect.offsetBy(dx: -state.canvas.minX, dy: -state.canvas.minY), expandedCanvas: true,
+                                 arrow: arrow(inWindow: state.canvas))
         surface.layoutSubtreeIfNeeded()
         guard t >= 1 else { return }
         resizeTimer?.invalidate(); resizeTimer = nil; resizeState = nil
@@ -317,7 +420,7 @@ final class PopupPresentation {
         usesExpandedCanvas = expanded
         if panel.hasShadow == expanded { panel.hasShadow = !expanded }
         if panel.frame != windowFrame { panel.setFrame(windowFrame, display: false) }
-        surface.configureContent(frame: contentRect, expandedCanvas: expanded)
+        surface.configureContent(frame: contentRect, expandedCanvas: expanded, arrow: arrow(inWindow: windowFrame))
         surface.layoutSubtreeIfNeeded()
         if previousContentSize != surface.content.bounds.size { onLayout() }
         if !expanded { panel.invalidateShadow() }
@@ -330,7 +433,7 @@ final class PopupPresentation {
         if coldOpen {
             applyCanvas(expanded: !reduceMotion)
             surface.setPresentation(transform: reduceMotion ? .identity : geometry.transform(at: 0),
-                                    opacity: reduceMotion ? 0 : 0.78, duration: 0)
+                                    opacity: 0, duration: 0)
         }
         onHidden = nil; wantsVisible = true
         panel.ignoresMouseEvents = false
@@ -375,7 +478,7 @@ final class PopupPresentation {
         let token = generation
         let observed = surface.sampledPresentation
         let startTransform = geometry.startingTransform(coldOpen: coldOpen && !reduceMotion, current: observed.transform)
-        let startOpacity: CGFloat = coldOpen && !reduceMotion ? 0.78 : observed.opacity
+        let startOpacity: CGFloat = coldOpen && !reduceMotion ? 0 : observed.opacity
         let current = geometry.progress(of: startTransform)
         targetProgress = target
         let duration = animated && !reduceMotion ? (target == 1 ? 0.24 : 0.17) * Double(abs(target - current)) : 0
@@ -540,10 +643,7 @@ private enum PopupTransitionRecorder {
     private static var records: [[String: Any]] = []
     private static let sessionID = UUID().uuidString
 
-    private static var diagnosticsDirectory: URL? {
-        guard let root = Bundle.main.object(forInfoDictionaryKey: "WorkspaceRoot") as? String else { return nil }
-        return URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent("Data/Diagnostics", isDirectory: true)
-    }
+    private static var diagnosticsDirectory: URL? { AppDataLocation.diagnosticsDirectory }
 
     static var isEnabled: Bool {
         guard let diagnosticsDirectory else { return false }

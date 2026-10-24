@@ -133,6 +133,7 @@ final class DockBarController: NSObject {
 
     /// 使用当前呈现矩形；面板、菜单和 VoiceOver 与用户看到的位置一致。
     func anchorRect(for id: String) -> CGRect? { surface?.screenRect(for: id) }
+    func previewAnchor(for id: String) -> WindowPreviewController.Anchor? { surface?.previewAnchor(for: id) }
     /// 未放大时的位置（静止布局），不随指针悬停变化。
     func restingRect(for id: String) -> CGRect? { surface?.restingScreenRect(for: id) }
     func retainGroupAnchor(_ id: String) { surface?.retainGroupAnchor(id) }
@@ -229,6 +230,8 @@ final class DockBarController: NSObject {
         surface?.cancelInteraction()
         surface?.releaseActiveGroup()
         stopFrames()
+        // 观察者只加不撤的话，切换显示模式重建应用栏时会越积越多。
+        if let busyObserver { CFRunLoopRemoveObserver(CFRunLoopGetMain(), busyObserver, .commonModes); self.busyObserver = nil }
         pollTimer?.invalidate(); pollTimer = nil
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
@@ -257,7 +260,7 @@ final class DockBarController: NSObject {
             screen = eligibleScreens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? eligibleScreens.first
         }
         if let screen {
-            panel?.title = "Dock 文件夹 · 应用栏 · \(screen.localizedName)"
+            panel?.title = "DockApex · 应用栏 · \(screen.localizedName)"
             panel?.setAccessibilityTitle(panel?.title)
         }
     }
@@ -330,7 +333,7 @@ final class DockBarController: NSObject {
 
     private func makePanel() {
         let panel = DockMotionPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        panel.title = "Dock 文件夹 · 应用栏"
+        panel.title = "DockApex · 应用栏"
         panel.setAccessibilityTitle(panel.title)
         // 影子模式下系统 Dock 与补底位于 Dock 层及其上一层，应用栏始终在两者之上。
         panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 2)
@@ -661,7 +664,7 @@ final class DockBarController: NSObject {
     /// 若移动窗口本身，每帧都要同步重排玻璃并与 WindowServer 往返一次，是悬停掉帧的主要来源。
     private func ensureHintPanel() {
         guard hintPanel == nil else { return }
-        let (panel, label) = HintBubbleView.makePanel(title: "Dock 文件夹 · 操作提示")
+        let (panel, label) = HintBubbleView.makePanel(title: "DockApex · 操作提示")
         let bubble = panel.contentView as? HintBubbleView
         let strip = NSView()
         strip.wantsLayer = true
@@ -683,8 +686,14 @@ final class DockBarController: NSObject {
         return strip.contains(bubble) ? strip : strip.union(bubble)
     }
 
+    /// 窗口预览出现时收起名称提示（预览里已有窗口标题）。
+    func hideNameHint() {
+        if hintPanel?.isVisible == true { hintPanel?.orderOut(nil) }
+        lastHint = nil
+    }
+
     private func showHint(_ text: String?, anchor: CGRect) {
-        guard !suppressesHint, let text, exposure > 0.9 else {
+        guard !suppressesHint, !WindowPreviewController.shared.isShown, let text, exposure > 0.9 else {
             if hintPanel?.isVisible == true { hintPanel?.orderOut(nil) }
             lastHint = nil
             return
@@ -764,6 +773,7 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
     private let overlay = DockMotionOverlay()
     private var pointer = CGPoint.zero
     private var hotID: String?
+    private var reportedHover: String?
     private var activeGroupID: String?
     private var activeGroupSnapshot: DockMotionSnapshot?
     /// 静止布局按哪个尺寸算的。应用栏窗口随条目增减逐帧改尺寸，旧尺寸里算出的位置会让图标偏离面板。
@@ -795,6 +805,7 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
     private weak var forwardedMenuDelegate: NSMenuDelegate?
     private var menuID: String?
     private var menuSnapshot: DockMotionSnapshot?
+    private var menuClosedAt: TimeInterval?
     private var dragSizes: [String: CGFloat] = [:]
     private var mergeSnapshot: DockMotionSnapshot?
     private var overlayState = DockMotionOverlayState()
@@ -803,13 +814,14 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
         super.init(frame: frameRect)
         wantsLayer = true
         if #available(macOS 26.0, *) {
-            let glass = NSGlassEffectView(); glass.style = .regular; glass.cornerRadius = 15
+            // 圆角对齐原生 Dock：10-23 同一壁纸下截图拟合原生约 13.4 点（原先 15 点偏圆）。
+            let glass = NSGlassEffectView(); glass.style = .regular; glass.cornerRadius = 13
             glass.contentView = NSView()
             // 不开交互玻璃：实测悬停放大扫动时它让每帧多出约 3ms 的玻璃重排，120Hz 下明显掉帧。
             backdrop = glass
         } else {
             let effect = NSVisualEffectView(); effect.material = .popover; effect.blendingMode = .behindWindow; effect.state = .active
-            effect.wantsLayer = true; effect.layer?.cornerRadius = 15; effect.layer?.masksToBounds = true
+            effect.wantsLayer = true; effect.layer?.cornerRadius = 13; effect.layer?.masksToBounds = true
             backdrop = effect
         }
         backdrop.setAccessibilityElement(false)
@@ -860,6 +872,17 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
     private func canMove(_ id: String) -> Bool { !id.hasPrefix("system:") && id != Self.finderID }
     private var localPointer: CGPoint {
         pointer
+    }
+
+    /// 窗口预览的弹出位置：与右键菜单一样从图标外侧弹出（底部 Dock 时在上方），箭头指向此刻图标的位置。
+    /// 应用栏窗口按最大放大量定长、不随放大变化，预览挂在栏上不会跟着放大回落横移。
+    func previewAnchor(for id: String) -> WindowPreviewController.Anchor? {
+        guard let frame = presented[id] else { return nil }
+        switch position {
+        case .bottom: return .init(view: self, rect: CGRect(x: frame.minX, y: frame.minY, width: frame.width, height: frame.height + 3), edge: .maxY)
+        case .left: return .init(view: self, rect: CGRect(x: frame.minX, y: frame.minY, width: frame.width + 3, height: frame.height), edge: .maxX)
+        case .right: return .init(view: self, rect: CGRect(x: frame.minX - 3, y: frame.minY, width: frame.width + 3, height: frame.height), edge: .minX)
+        }
     }
 
     func screenRect(for id: String) -> CGRect? {
@@ -925,6 +948,8 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
         let inside = containsScreenPoint(screenPoint)
         let hot = activeGroupID ?? (inside ? DockMotionLayout.hitTest(pointer, frames: presented, orderedIDs: items.map(\.id), expansion: 5) : nil)
         hotID = hot
+        let hovered = isDragging || observedMenu != nil || activeGroupID != nil ? nil : hot
+        if hovered != reportedHover { reportedHover = hovered; Self.onHoverChanged?(hovered) }
         var magnificationPointer: CGPoint?
         if !isDragging {
             if let pressedPointer { magnificationPointer = pressedPointer }
@@ -936,14 +961,20 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
         let groupSettling = activeGroupSnapshot != nil && !isDragging
         let target: CGFloat = magnificationPointer != nil && !groupSettling ? 1 : 0
         if let magnificationPointer { lastMagnificationPointer = magnificationPointer }
-        if reduce { magnifyAmount = target }
+        // 菜单开着时放大量与布局一起冻结。否则指针移到菜单上时放大量照常衰减，关菜单那一帧布局按衰减后的放大量重算，
+        // 图标先猛地缩小再长回来，看起来一闪（10-23 逐帧实测关菜单一帧内 62 → 57 点）。
+        if menuSnapshot != nil {}
+        else if reduce { magnifyAmount = target }
         else if target > magnifyAmount { magnifyAmount = min(1, magnifyAmount + CGFloat(delta / 0.12)) }
         else if target < magnifyAmount { magnifyAmount = max(0, magnifyAmount - CGFloat(delta / 0.11)) }
         let eased = magnifyAmount * magnifyAmount * (3 - 2 * magnifyAmount)
         var effective = metrics
         effective.maximumIconSize = metrics.iconSize + (metrics.maximumIconSize - metrics.iconSize) * eased
         let magnifying = magnifyAmount > 0 && !isDragging
-        let fraction: CGFloat = reduce || (!groupSettling && (magnifying || target == 1)) ? 1 : CGFloat(1 - exp(-delta / 0.045))
+        // 关菜单后约 0.2 秒内从冻结的布局缓到当前目标（与指针移出栏时同样的缓动），不在一帧里跳过去；之后恢复放大即时跟手。
+        let easingOutOfMenu = menuClosedAt.map { interactionTime - $0 < 0.2 } ?? false
+        if !easingOutOfMenu { menuClosedAt = nil }
+        let fraction: CGFloat = reduce || (!easingOutOfMenu && !groupSettling && (magnifying || target == 1)) ? 1 : CGFloat(1 - exp(-delta / 0.045))
         let geometryMoving = installSnapshot(pointer: magnifying ? lastMagnificationPointer : nil, fraction: fraction, time: time,
                                              metrics: magnifying ? effective : metrics)
             || (magnifyAmount > 0 && magnifyAmount < 1)
@@ -1222,6 +1253,8 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
         menu?.delegate = self
         return menu
     }
+    /// 悬停的条目变了（nil 为离开或正在拖动、开菜单、展开分组），窗口预览据此弹出。由应用控制器设置。
+    static var onHoverChanged: ((String?) -> Void)?
     /// 当前展开的分组面板（分组条目 ID 与面板屏幕坐标）；拖到面板上松开即加入该分组。由应用控制器设置。
     static var openGroupTarget: (() -> (id: String, frame: CGRect)?)?
     /// 拖到展开的分组面板上时，让面板按指针位置让出空位（nil 表示离开面板）。由应用控制器设置。
@@ -1288,6 +1321,7 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
         forwardedMenuDelegate?.menuDidClose?(menu)
         forwardedMenuDelegate = nil
         observedMenu = nil; menuID = nil; menuSnapshot = nil
+        menuClosedAt = ProcessInfo.processInfo.systemUptime
         onHold?("menu", false)
         onNeedsFrames?()
     }
@@ -1326,10 +1360,18 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
         if isInternalReference(sender.draggingPasteboard) { return allowed.contains(.move) ? .move : .copy }
         if isFileOperationTarget(target) {
             if target == "system:trash" { return allowed.contains(.move) ? .move : [] }
-            if NSApp.currentEvent?.modifierFlags.contains(.option) == true { return allowed.contains(.copy) ? .copy : [] }
-            return allowed.contains(.move) ? .move : .copy
+            guard copiesFiles(urls, to: target, allowed: allowed) else { return .move }
+            return allowed.contains(.copy) ? .copy : []
         }
         return Self.referenceOperation(allowed)
+    }
+    /// 拖到文件夹入口时拷贝还是移动，规则见 FileDropOperation。
+    private func copiesFiles(_ urls: [URL], to target: String?, allowed: NSDragOperation) -> Bool {
+        let modifiers = NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags
+        guard let target, target.hasPrefix("file:") else { return modifiers.contains(.option) || !allowed.contains(.move) }
+        return FileDropOperation.copies(urls, into: URL(fileURLWithPath: String(target.dropFirst(5))),
+                                        option: modifiers.contains(.option), command: modifiers.contains(.command),
+                                        moveAllowed: allowed.contains(.move))
     }
     /// 加到应用栏只记引用、不动文件：在来源允许的操作里依次选拷贝、链接、通用。来源只允许链接时
     /// （如系统 App 启动器）一律回“拷贝”会被系统判为不可放下。
@@ -1357,7 +1399,7 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
         endExternal()
         guard !urls.isEmpty, !(internalReference && isFileOperationTarget(target)) else { return false }
         let drop = DockExternalDrop(urls: urls, targetID: target, isApplicationReference: internalReference,
-                                    copyFiles: NSApp.currentEvent?.modifierFlags.contains(.option) == true || !sender.draggingSourceOperationMask.contains(.move),
+                                    copyFiles: copiesFiles(urls, to: target, allowed: sender.draggingSourceOperationMask),
                                     insertionIndex: target == nil ? gap : nil)
         DispatchQueue.main.async { [weak self] in self?.onExternalDrop?(drop) }
         return true
@@ -1444,6 +1486,7 @@ final class DockMotionIcon: NSView {
     weak var surface: DockMotionSurface?
     private let mergePreview = DockMergePreview()
     private var iconBitmap: CGImage?
+    private var pressedBitmap: CGImage?
     private var rasterizedIcon: NSImage?
     private let badgeView = DockBadgeView()
     var badgeSuppressed = false {
@@ -1488,6 +1531,7 @@ final class DockMotionIcon: NSView {
                     hints: [.interpolation: NSImageInterpolation.high])
             }
             rasterizedIcon = item.icon
+            pressedBitmap = nil
             mergePreview.targetImage = iconBitmap
             needsDisplay = true
         }
@@ -1512,6 +1556,8 @@ final class DockMotionIcon: NSView {
     func setMerge(_ state: DockMergePreview.State) { mergePreview.setState(state) }
     func landSource(_ image: CGImage?) { mergePreview.landSource(image) }
     override func accessibilityPerformPress() -> Bool { surface?.open(item.id); return true }
+    /// 与原生 Dock 的格子一致，辅助功能可直接弹出右键菜单（VoiceOver 的“显示菜单”）。
+    override func accessibilityPerformShowMenu() -> Bool { surface?.showMenu(for: item.id); return true }
     override func mouseDown(with event: NSEvent) {
         guard let surface else { return }
         if event.modifierFlags.contains(.control) { surface.showMenu(for: item.id); return }
@@ -1582,8 +1628,9 @@ final class DockMotionIcon: NSView {
         layer.minificationFilter = .trilinear
         layer.magnificationFilter = .linear
         // 合并预览接管图标画面（目标图标改由预览里的图层显示，才能缩进格子、垫上底板）。
-        layer.contents = mergePreview.isActive ? nil : iconBitmap
-        layer.opacity = pressed ? 0.63 : 1
+        // 按下照系统 Dock：换成颜色乘 0.4 的图，透明度不变，玻璃不会透上来。
+        if pressed, pressedBitmap == nil, let iconBitmap { pressedBitmap = DockPressDarkening.darkened(iconBitmap) }
+        layer.contents = mergePreview.isActive ? nil : pressed ? pressedBitmap ?? iconBitmap : iconBitmap
     }
     override func layout() {
         super.layout()

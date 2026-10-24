@@ -25,15 +25,9 @@ enum NativeHostRecoveryCommand {
             if options.help { printHelp(); return true }
             let bundle = Bundle.main
             guard bundle.bundleIdentifier == "io.daliang.dockfolders", bundle.bundleURL.pathExtension == "app" else {
-                throw Failure(code: 69, message: "请使用项目 build/DockFolders.app 内的主程序执行恢复命令。")
+                throw Failure(code: 69, message: "请使用 DockApex 应用包内的主程序执行恢复命令。")
             }
-            let dataDirectory: URL
-            if let explicit = options.dataDirectory { dataDirectory = explicit }
-            else if let root = bundle.object(forInfoDictionaryKey: "WorkspaceRoot") as? String, root.hasPrefix("/") {
-                dataDirectory = URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent("Data", isDirectory: true)
-            } else {
-                throw Failure(code: 69, message: "无法确定项目数据目录；请传入 --data-directory 和项目 Data 的绝对路径。")
-            }
+            let dataDirectory = options.dataDirectory ?? AppDataLocation.dataDirectory
             try stopRunningMainApplications()
             GroupEntryRuntimeCoordinator.stopOwnedEntries(dataDirectory: dataDirectory)
             if let archive = options.repairArchive {
@@ -168,7 +162,7 @@ enum NativeHostRecoveryCommand {
     private static func stopRunningMainApplications() throws {
         let applications = try runningMainApplications()
         guard !applications.isEmpty else { return }
-        print("正在请求 DockFolders 正常退出；分组暂时保留，随后执行条件恢复。")
+        print("正在请求 DockApex 正常退出；分组暂时保留，随后执行条件恢复。")
         for application in applications {
             guard application.terminate() else {
                 throw Failure(code: 75, message: "主应用未接受正常退出请求，已停止恢复；没有强制结束进程。")
@@ -190,7 +184,7 @@ enum NativeHostRecoveryCommand {
 
     private static func printHelp() {
         print("""
-        DockFolders 原生 Dock 分组恢复
+        DockApex：原生 Dock 分组恢复
 
         用法：DockFolders --restore-native-host [--data-directory <项目 Data 的绝对路径>]
               DockFolders --repair-unpersisted-commit <项目 Backups 下的完整归档目录>

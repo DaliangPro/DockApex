@@ -102,6 +102,7 @@ final class ShelfStore {
         }
         configuration.normalize()
         if previous?.version == 1 { previous?.normalize() } else { previous = nil }
+        backUpDaily()
     }
 
     func save(_ next: ShelfConfiguration, recordUndo: Bool = true) throws {
@@ -110,6 +111,7 @@ final class ShelfStore {
         next.normalize()
         guard next != configuration || !FileManager.default.fileExists(atPath: fileURL.path) else { return }
         let archive = ShelfArchive(configuration: next, previous: recordUndo ? configuration : previous)
+        backUpDaily()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(archive).write(to: fileURL, options: .atomic)
@@ -121,12 +123,33 @@ final class ShelfStore {
         guard let previous else { return }
         try save(previous)
     }
+
+    /// 撤销快照和当前布局存在同一个文件里，文件坏了两份一起丢。每天第一次保存前把现有文件复制到
+    /// ShelfBackups/shelf-日期.json，只留最近 7 天。
+    private func backUpDaily() {
+        let folder = root.appendingPathComponent("ShelfBackups", isDirectory: true)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.dateFormat = "yyyy-MM-dd"
+        let target = folder.appendingPathComponent("shelf-\(formatter.string(from: Date())).json")
+        let files = FileManager.default
+        guard files.fileExists(atPath: fileURL.path), !files.fileExists(atPath: target.path) else { return }
+        try? files.createDirectory(at: folder, withIntermediateDirectories: true)
+        guard (try? files.copyItem(at: fileURL, to: target)) != nil,
+              let names = try? files.contentsOfDirectory(atPath: folder.path) else { return }
+        for name in names.filter({ $0.hasPrefix("shelf-") && $0.hasSuffix(".json") }).sorted().dropLast(7) {
+            try? files.removeItem(at: folder.appendingPathComponent(name))
+        }
+    }
 }
 
 @MainActor
 final class ActivityLog {
     let url: URL
     init(root: URL) { url = root.appendingPathComponent("activity.jsonl") }
+
+    /// 超过约 5 MB 就改名留档（activity-时间.jsonl），只留最近 3 份。
+    static let rotationSize: UInt64 = 5_000_000
+    static let keptArchives = 3
 
     func record(_ message: String) {
         let entry = ["time": ISO8601DateFormatter().string(from: Date()), "message": message]
@@ -135,10 +158,25 @@ final class ActivityLog {
             _ = FileManager.default.createFile(atPath: url.path, contents: nil)
         }
         guard let handle = try? FileHandle(forWritingTo: url) else { return }
-        defer { try? handle.close() }
+        var size: UInt64 = 0
         do {
             try handle.seekToEnd()
             try handle.write(contentsOf: data + Data([10]))
+            size = try handle.offset()
         } catch { /* 日志失败不影响原生输入。 */ }
+        try? handle.close()
+        if size > Self.rotationSize { rotate() }
+    }
+
+    private func rotate() {
+        let folder = url.deletingLastPathComponent()
+        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "")
+        guard (try? FileManager.default.moveItem(at: url, to: folder.appendingPathComponent("activity-\(stamp).jsonl"))) != nil,
+              let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path) else { return }
+        // 时间戳按字典序即时间顺序。
+        let archives = names.filter { $0.hasPrefix("activity-") && $0.hasSuffix(".jsonl") }.sorted()
+        for name in archives.dropLast(Self.keptArchives) {
+            try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))
+        }
     }
 }

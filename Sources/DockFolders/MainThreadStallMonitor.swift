@@ -18,6 +18,12 @@ final class MainThreadStallMonitor: @unchecked Sendable {
     private var samples: [(at: TimeInterval, frames: [UInt])] = []
     private static let threshold: TimeInterval = 0.05
     private static let sampleAt: [TimeInterval] = [0.05, 0.15, 0.4]
+    /// 每分钟最多记几条（只在主线程读写）：出过一阵循环卡顿，一小时记了一千多条栈，日志涨到 60 MB。
+    /// 超出的只计数，下一条记录时一并说明。
+    private static let perMinute = 6
+    private var minuteStart: TimeInterval = 0
+    private var recordedThisMinute = 0
+    private var suppressed = 0
 
     @MainActor
     func start(report: @escaping @MainActor (String) -> Void) {
@@ -59,10 +65,16 @@ final class MainThreadStallMonitor: @unchecked Sendable {
         guard let since else { return nil }
         let elapsed = ProcessInfo.processInfo.systemUptime - since
         guard elapsed >= Self.threshold else { return nil }
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - minuteStart >= 60 { minuteStart = now; recordedThisMinute = 0 }
+        guard recordedThisMinute < Self.perMinute else { suppressed += 1; return nil }
+        recordedThisMinute += 1
+        let skipped = suppressed == 0 ? "" : "；此前另有 \(suppressed) 次卡顿超出每分钟 \(Self.perMinute) 条未记"
+        suppressed = 0
         let stacks = taken.map { sample in
             String(format: "[%.0f ms] ", sample.at * 1_000) + sample.frames.map { String(format: "0x%lx", $0) }.joined(separator: " ")
         }
-        return String(format: "主线程卡顿 %.0f ms（pid %d）", elapsed * 1_000, getpid())
+        return String(format: "主线程卡顿 %.0f ms（pid %d）", elapsed * 1_000, getpid()) + skipped
             + (stacks.isEmpty ? "" : "；栈：" + stacks.joined(separator: " | "))
     }
 

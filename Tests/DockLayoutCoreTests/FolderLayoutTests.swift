@@ -132,3 +132,66 @@ private func application(_ name: String) -> AppReference {
     #expect(!AppReference(path: desktop.path, name: "Hermes", bundleIdentifier: setup.bundleIdentifier).launches(desktop))
     #expect(!AppReference(path: setup.path, name: "Hermes", bundleIdentifier: nil).launches(desktop))
 }
+
+@Test func `整组成员都被移除后装回来，按原名原位重建分组`() throws {
+    let a = application("A"), b = application("B"), first = application("First")
+    let group = AppGroup(id: UUID(), name: "一起更新", apps: [a, b])
+    var layout = ShelfConfiguration(items: [.app(first), .group(group.id)], groups: [group])
+    let placements = try [a, b].map { try #require(layout.placement(of: $0)) }
+    layout.updateApplications { $0 == first ? .keep : .remove }
+    #expect(layout.groups.isEmpty && layout.items == [.app(first)])
+    // 装回来的顺序与原来相反，组内顺序仍按原位。
+    let restoredB = layout.restore(b, at: placements[1])
+    let restoredA = layout.restore(a, at: placements[0])
+    #expect(restoredA && restoredB)
+    #expect(layout.items == [.app(first), .group(group.id)])
+    #expect(layout.groups.first?.name == "一起更新")
+    #expect(layout.groups.first?.apps == [a, b])
+}
+
+@Test func `应用文件夹的无关写入不触发核对`() {
+    let apps: Set<String> = ["/Applications/Safari.app", "/Users/test/Coding/Tool/build/Tool.app"]
+    let changed = FolderLayout.relevantApplicationChanges([
+        "/Applications/Safari.app/Contents/Info.plist",          // 引用的应用更新
+        "/Applications/新装.app",                                  // 第一层装上新应用
+        "/Applications/新装.app/Contents/MacOS/新装",              // 新应用内部，不是引用的应用
+        "/Users/test/Coding/Tool/build/obj/main.o",               // 开发目录里的构建产物
+        "/Users/test/Coding/Tool/build/Tool.app/",                // 引用的应用本身（目录事件带斜杠）
+        "/Users/test/Applications/某个.app",                       // 额外监视的文件夹
+        "/Applications/Utilities/某工具.app"                       // 没监视的子文件夹
+    ], applications: apps, extraFolders: ["/Applications", "/Users/test/Applications"])
+    #expect(changed == ["/Applications/Safari.app/Contents/Info.plist", "/Applications/新装.app",
+                        "/Users/test/Coding/Tool/build/Tool.app", "/Users/test/Applications/某个.app"])
+}
+
+@Test func `自动移除的应用很快装回来时放回原位`() throws {
+    let a = application("A"), b = application("B"), gone = application("Gone"), x = application("X"), y = application("Y"), member = application("Member")
+    let group = AppGroup(id: UUID(), name: "常用", apps: [x, member, y])
+    var layout = ShelfConfiguration(items: [.app(a), .app(gone), .group(group.id), .app(b)], groups: [group])
+    let pinned = try #require(layout.placement(of: gone))
+    let grouped = try #require(layout.placement(of: member))
+    #expect(pinned == .pinned(index: 1))
+    #expect(grouped == .group(group.id, name: "常用", slot: 2, index: 1))
+    layout.updateApplications { $0 == gone || $0 == member ? .remove : .keep }
+    #expect(layout.items == [.app(a), .group(group.id), .app(b)])
+    let restoredPinned = layout.restore(gone, at: pinned)
+    let restoredMember = layout.restore(member, at: grouped)
+    #expect(restoredPinned && restoredMember)
+    #expect(layout.items == [.app(a), .app(gone), .group(group.id), .app(b)])
+    #expect(layout.groups.first?.apps == [x, member, y])
+    // 已经在了就不重复放。
+    let again = layout.restore(gone, at: pinned)
+    #expect(!again)
+}
+
+@Test func `装到别处的同一应用也按原位放回`() {
+    let a = application("A"), member = application("Member"), other = application("Other")
+    let moved = AppReference(path: "/Users/test/Applications/Member.app", name: "Member", bundleIdentifier: member.bundleIdentifier)
+    let group = AppGroup(id: UUID(), name: "常用", apps: [member, other])
+    var layout = ShelfConfiguration(items: [.app(a), .group(group.id)], groups: [group])
+    let placement = layout.placement(of: member)!
+    layout.updateApplications { $0 == member ? .remove : .keep }
+    let restored = layout.restore(moved, at: placement)
+    #expect(restored)
+    #expect(layout.groups.first?.apps == [moved, other])
+}

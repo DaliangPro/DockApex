@@ -30,6 +30,8 @@ final class GroupPanelController {
     var currentGroupID: UUID? { isOpen ? content?.group.id : nil }
     /// 展开时面板的屏幕位置；应用栏拖动时据此判断是否拖进了分组。
     var presentedFrame: CGRect? { isOpen ? panel?.frame : nil }
+    /// 窗口预览出现时收起成员名称提示。
+    func hideMemberNameHint() { content?.hideNameHint() }
     /// 拖动关键步骤的耗时记录（写入活动日志），用于核对拖出分组的首帧卡顿。
     static var log: ((String) -> Void)?
     /// 成员拖出面板后交给应用栏预览（nil 表示回到面板内）；松开时由应用栏决定是否接收。由应用控制器设置。
@@ -96,7 +98,7 @@ final class GroupPanelController {
         pendingExternalDismissal = false
         content.setGroup(group)
         content.setBadges(badges)
-        panel.title = "Dock 文件夹 · 分组：\(group.name)"
+        panel.title = "DockApex · 分组：\(group.name)"
         panel.setAccessibilityTitle(panel.title)
         layoutPanel(scrollToTop: true)
         content.prepareForPresentation(keyboard: NSApp.currentEvent?.type == .keyDown)
@@ -110,11 +112,11 @@ final class GroupPanelController {
     /// 数据刷新不切换开关状态，也不抢走正在输入的名称。
     func refresh(group: AppGroup) {
         guard currentGroupID == group.id else { return }
-        panel?.title = "Dock 文件夹 · 分组：\(group.name)"
+        panel?.title = "DockApex · 分组：\(group.name)"
         panel?.setAccessibilityTitle(panel?.title ?? "")
         guard content?.group != group else { return }
         content?.setGroup(group)
-        panel?.title = "Dock 文件夹 · 分组：\(group.name)"
+        panel?.title = "DockApex · 分组：\(group.name)"
         layoutPanel()
     }
 
@@ -253,8 +255,10 @@ final class GroupPanelController {
                 }
                 if event.type != .keyDown, event.window !== self.panel {
                     if self.content?.isPresentingMenu == true || self.content?.isDragging == true { return false }
+                    // 点窗口预览（弹出框挂在面板上）不算点外面，否则面板先收起、预览随之消失，点不中缩略图。
+                    if WindowPreviewController.shared.owns(event.window) { return false }
                     // 栏内点击由同一进程直接切换；无需时间与距离猜测。
-                    if event.window?.title.hasPrefix("Dock 文件夹 · 应用栏") != true { self.hide(reason: "local-outside") }
+                    if event.window?.title.hasPrefix("DockApex · 应用栏") != true { self.hide(reason: "local-outside") }
                 }
                 return false
             }
@@ -435,12 +439,23 @@ private final class GroupGridView: NSView {
 
     func tileHovered(_ tile: GroupTileView, inside: Bool) {
         if inside, !isDragging { showNameHint(for: tile) } else { nameHint.hide(for: tile) }
+        // 运行中的成员停 0.3 秒弹窗口预览，箭头对准成员图标。
+        guard inside, !isDragging, ShelfAppActions.running(tile.app) != nil else {
+            WindowPreviewController.shared.hover(nil, source: .group) { nil }
+            return
+        }
+        // 与成员的右键菜单同一个定位：格子里的图标、向上弹出。
+        WindowPreviewController.shared.hover(tile.app, source: .group) { [weak tile] in
+            guard let tile else { return nil }
+            let icon = tile.iconRect
+            return .init(view: tile, rect: CGRect(x: icon.minX, y: icon.minY, width: icon.width, height: icon.height + 3), edge: .maxY)
+        }
     }
 
     func hideNameHint() { nameHint.hide() }
 
     private func showNameHint(for tile: GroupTileView) {
-        guard let window = tile.window, window.isVisible else { return }
+        guard !WindowPreviewController.shared.isShown, let window = tile.window, window.isVisible else { return }
         nameHint.show(tile.app.name, above: window.convertToScreen(tile.convert(tile.iconRect, to: nil)), for: tile)
     }
 
@@ -699,7 +714,7 @@ private final class GroupGridView: NSView {
     private func ensureGhostPanel() {
         guard ghostPanel == nil else { return }
         let panel = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 54, height: 54), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        panel.title = "Dock 文件夹 · 分组拖动"
+        panel.title = "DockApex · 分组拖动"
         panel.level = .popUpMenu; panel.isOpaque = false; panel.backgroundColor = .clear
         panel.ignoresMouseEvents = true; panel.hasShadow = true; panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .canJoinAllApplications]
@@ -813,7 +828,7 @@ private final class GroupNameHint {
     private var owner: ObjectIdentifier?
 
     func show(_ text: String, above anchor: CGRect, for tile: AnyObject) {
-        if panel == nil { let made = HintBubbleView.makePanel(title: "Dock 文件夹 · 分组成员名称"); panel = made.0; label = made.1 }
+        if panel == nil { let made = HintBubbleView.makePanel(title: "DockApex · 分组成员名称"); panel = made.0; label = made.1 }
         guard let panel, let label else { return }
         owner = ObjectIdentifier(tile)
         if label.stringValue != text { label.stringValue = text }
@@ -874,12 +889,16 @@ private final class GroupTileView: NSView {
         needsDisplay = true
     }
     override func draw(_ dirtyRect: NSRect) {
-        if pressed || keyboardSelected {
-            NSColor.selectedContentBackgroundColor.withAlphaComponent(pressed ? 0.28 : 0.16).setFill()
+        if keyboardSelected {
+            NSColor.selectedContentBackgroundColor.withAlphaComponent(0.16).setFill()
             NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 2), xRadius: 12, yRadius: 12).fill()
         }
-        runtimeImage?.draw(in: iconRect,
-                                       from: .zero, operation: .sourceOver, fraction: pressed ? 0.68 : 1)
+        // 按下与应用栏一致，照系统 Dock 堆栈：只把图标颜色乘 0.4，不画选框、不改透明度。
+        if pressed, let runtimeImage, let context = NSGraphicsContext.current?.cgContext {
+            DockPressDarkening.drawPressed(in: context, rect: iconRect) { runtimeImage.draw(in: iconRect) }
+        } else {
+            runtimeImage?.draw(in: iconRect)
+        }
         if runtimeIsRunning {
             NSColor.labelColor.withAlphaComponent(0.7).setFill()
             NSBezierPath(ovalIn: CGRect(x: bounds.midX - 2, y: 3, width: 4, height: 4)).fill()

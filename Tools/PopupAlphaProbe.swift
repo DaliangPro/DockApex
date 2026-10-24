@@ -78,7 +78,7 @@ struct PopupAlphaProbe {
             let owned = content.windows.filter { $0.owningApplication?.processID == pid }
             let popups = owned.filter { window in
                 guard window.isOnScreen, window.frame.width > 0, window.frame.height > 0, let title = window.title else { return false }
-                return title.hasPrefix("Dock 文件夹 · 分组：") || title.hasPrefix("Dock 文件夹 · 文件夹：")
+                return title.hasPrefix("DockApex · 分组：") || title.hasPrefix("DockApex · 文件夹：")
             }
             guard !popups.isEmpty else { throw ProbeError.message("当前没有可见的本应用分组或文件夹面板；未测。") }
             var captures: [[String: Any]] = []
@@ -100,7 +100,7 @@ struct PopupAlphaProbe {
                 let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
                 withExtendedLifetime(transparentBackground) {}
                 let sample = try alphaSamples(image)
-                captures.append(["kind": window.title?.hasPrefix("Dock 文件夹 · 分组：") == true ? "group" : "files",
+                captures.append(["kind": window.title?.hasPrefix("DockApex · 分组：") == true ? "group" : "files",
                                  "windowID": window.windowID, "ownerPID": pid,
                                  "windowFramePoints": rect(window.frame), "filterContentRectPoints": rect(captureRect),
                                  "pointPixelScale": Double(scale), "configuredWidthPixels": configuration.width,

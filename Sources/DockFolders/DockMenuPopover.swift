@@ -14,7 +14,7 @@ final class DockMenuPopover: NSObject, NSPopoverDelegate {
     private var onClose: (() -> Void)?
     /// 由按下（右键或长按）打开、按键还没松开：此时拖到项上松开即选中。
     private var pressActive = false
-    /// 打开前在前台的 App；点选弹出框若让本应用变成活跃，关闭后交还。
+    /// 打开前在前台的 App；系统不支持补防激活标记、点选让本应用变成活跃时，关闭后交还。
     private var previousApp: NSRunningApplication?
 
     var isShown: Bool { popover?.isShown == true }
@@ -44,7 +44,7 @@ final class DockMenuPopover: NSObject, NSPopoverDelegate {
         popover.show(relativeTo: rect, of: view, preferredEdge: edge)
         if let window = list.window {
             // 与系统菜单一样点选时不激活本应用、不抢走当前 App 的键盘焦点。
-            if let panel = window as? NSPanel { panel.styleMask.insert(.nonactivatingPanel); panel.becomesKeyOnlyIfNeeded = !keyboard }
+            if let panel = window as? NSPanel { panel.preventActivation(); panel.becomesKeyOnlyIfNeeded = !keyboard }
             if keyboard { window.makeKey(); window.makeFirstResponder(list); list.highlightFirst() }
         }
         installMonitors()

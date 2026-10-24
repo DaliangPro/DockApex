@@ -143,6 +143,11 @@ final class DockDisplayCoordinator {
         return activeBar?.anchorRect(for: id) ?? orderedBars.compactMap { $0.anchorRect(for: id) }.first
     }
 
+    /// 指针所在的应用栏上这个条目的预览弹出位置。
+    func previewAnchor(for id: String, nearAppKitPoint point: CGPoint) -> WindowPreviewController.Anchor? {
+        (nearestBar(to: point) ?? activeBar)?.previewAnchor(for: id)
+    }
+
     func anchorRects(for id: String) -> [CGRect] { orderedBars.compactMap { $0.anchorRect(for: id) } }
     /// 当前应用栏上未放大时的位置。
     func restingRect(for id: String) -> CGRect? { activeBar?.restingRect(for: id) }
@@ -183,6 +188,7 @@ final class DockDisplayCoordinator {
     }
 
     private var orderedBars: [DockBarController] { bars.keys.sorted().compactMap { bars[$0] } }
+    func hideNameHints() { for bar in bars.values { bar.hideNameHint() } }
     private var selectedKey: String? { activeKey.flatMap { bars[$0] != nil ? $0 : nil } ?? bars.keys.sorted().first }
     private var activeBar: DockBarController? { selectedKey.flatMap { bars[$0] } }
 

@@ -218,3 +218,9 @@ private let lgZone = DockWorkAreaZone(displayUUID: "LG", screenFrame: lgScreen, 
     #expect(DockWorkAreaGeometry.floatingAdjustment(CGRect(x: 1390, y: 400, width: 200, height: 80), zones: [workZone(.right)])
             == CGPoint(x: 1330, y: 400))
 }
+
+@Test func `重试只按还在将来的时刻调度，过期没轮到的不再空转`() {
+    #expect(DockWorkAreaGeometry.nextRetry([], now: 10) == nil)
+    #expect(DockWorkAreaGeometry.nextRetry([9, 9.5], now: 10) == nil)
+    #expect(DockWorkAreaGeometry.nextRetry([9, 11, 10.5], now: 10) == 10.5)
+}

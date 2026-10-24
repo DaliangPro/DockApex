@@ -39,6 +39,11 @@ final class DockIconProvider {
     }
 
     private var applications: [String: ApplicationEntry] = [:]
+    /// 应用包还在时最后取到的图标；应用包暂时不在时（缓存已因目录变化清掉）用它画“找不到”图标。
+    private var lastFound: [String: NSImage] = [:]
+    private var broken: [String: (source: ObjectIdentifier, image: NSImage)] = [:]
+    /// 原生 Dock 的“找不到”覆盖图：灰色问号，`-[DOCKFileTile convertToBroken]` 以 0.8 不透明度叠在图标上。
+    private static let notFoundOverlay = Bundle(path: "/System/Library/CoreServices/Dock.app")?.image(forResource: "notfoundover")
     private var groups: [UUID: GroupEntry] = [:]
     private var minimized: [String: MinimizedEntry] = [:]
     private(set) var statistics = Statistics()
@@ -46,6 +51,11 @@ final class DockIconProvider {
     func icon(for app: AppReference) -> NSImage {
         // App 自带 Dock 图标插件时用插件画出的图标，与原生 Dock 一致（用户在 App 里换过的图标只走这条路）。
         if let image = DockTilePluginService.shared.image(for: app.path) { return image }
+        // 应用包暂时不在（更新替换中、被移走或卸载待移除）：照原生 Dock 留着原图标、叠上灰色问号，等它回来或被移除。
+        if !FileManager.default.fileExists(atPath: app.path), ShelfRunningApplications.shared.running(app) == nil {
+            return brokenIcon(for: app)
+        }
+        broken[app.path] = nil
         let now = ProcessInfo.processInfo.systemUptime
         if let entry = applications[app.path], now < entry.checkAfter {
             statistics.applicationCacheHits += 1
@@ -71,8 +81,20 @@ final class DockIconProvider {
         let image = runningImage ?? NSWorkspace.shared.icon(forFile: app.path)
         applications[app.path] = ApplicationEntry(image: image, sourcePID: runningImage == nil ? nil : running?.processIdentifier,
                                                   checkAfter: now + 1, fileSourceLoadedAt: now)
+        lastFound[app.path] = image
         statistics.applicationSourceLoads += 1
         trimApplicationsIfNeeded(keeping: app.path)
+        return image
+    }
+
+    private func brokenIcon(for app: AppReference) -> NSImage {
+        let base = lastFound[app.path] ?? applications[app.path]?.image ?? NSWorkspace.shared.icon(forFile: app.path)
+        if let entry = broken[app.path], entry.source == ObjectIdentifier(base) { return entry.image }
+        let image = Self.bitmapImage(size: NSSize(width: 128, height: 128), appearance: NSApp.effectiveAppearance) { rect in
+            base.draw(in: rect)
+            Self.notFoundOverlay?.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 0.8)
+        }
+        broken[app.path] = (ObjectIdentifier(base), image)
         return image
     }
 

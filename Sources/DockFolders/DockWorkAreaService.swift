@@ -124,7 +124,8 @@ private actor DockWorkAreaReader {
 
     /// 最早一次待重试的写入时刻；写入没生效时只有窗口事件或 4 秒兜底才会再看，由服务按这个时刻主动再查一轮。
     func nextRetry() -> TimeInterval? {
-        candidates.values.filter { $0.failures > 0 && !$0.refused }.map(\.retryAt).min()
+        DockWorkAreaGeometry.nextRetry(candidates.values.filter { $0.failures > 0 && !$0.refused }.map(\.retryAt),
+                                       now: ProcessInfo.processInfo.systemUptime)
     }
 
     private func note(_ pid: pid_t, _ text: String) {
@@ -132,6 +133,12 @@ private actor DockWorkAreaReader {
     }
 
     func synchronize(_ request: DockWorkAreaRequest, lease: DockWorkAreaLease) -> DockWorkAreaReport {
+        // 候选按“进程号:启动时间:窗口”记；已退出的 App 留下的候选每轮按当前进程列表清掉。
+        let running = Set((request.regularProcesses + [request.front].compactMap { $0 }).filter(\.isValid).map { "\($0.pid):\($0.identity):" })
+        candidates = candidates.filter { key, _ in
+            let parts = key.split(separator: ":", maxSplits: 2)
+            return parts.count == 3 && running.contains("\(parts[0]):\(parts[1]):")
+        }
         traceURL = request.traceURL
         if traceURL == nil { traceEvents.removeAll() }
         passNumber &+= 1
@@ -530,10 +537,7 @@ final class DockWorkAreaService {
     private var lastMouseDown: TimeInterval = 0
     private var pointerBlockedPasses = 0
     private var quietBlockedPasses = 0
-    private lazy var traceDirectory: URL = {
-        let root = Bundle.main.object(forInfoDictionaryKey: "WorkspaceRoot") as? String ?? FileManager.default.currentDirectoryPath
-        return URL(fileURLWithPath: root).appendingPathComponent("Data/Diagnostics", isDirectory: true)
-    }()
+    private lazy var traceDirectory: URL = AppDataLocation.diagnosticsDirectory
 
     func start() {
         guard !enabled else { return }

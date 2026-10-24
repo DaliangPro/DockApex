@@ -110,6 +110,12 @@ enum DockWorkAreaGeometry {
         approximatelyEqual(current, lastApplied, tolerance: tolerance) ? original : nil
     }
 
+    /// 收短写入没生效的窗口下次重试的时刻，只算还在将来的。过期却没轮到的（App 已退出、隐藏或移出可见范围，
+    /// 这一轮没有扫描它）不算，否则调度每 0.05 秒就再跑一轮完整检查，一直空转。
+    static func nextRetry(_ retryTimes: [TimeInterval], now: TimeInterval) -> TimeInterval? {
+        retryTimes.filter { $0 > now }.min()
+    }
+
     static func approximatelyEqual(_ lhs: CGRect, _ rhs: CGRect, tolerance: CGFloat = 1.5) -> Bool {
         abs(lhs.minX - rhs.minX) <= tolerance && abs(lhs.minY - rhs.minY) <= tolerance
             && abs(lhs.width - rhs.width) <= tolerance && abs(lhs.height - rhs.height) <= tolerance

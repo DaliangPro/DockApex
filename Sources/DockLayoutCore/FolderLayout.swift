@@ -214,3 +214,60 @@ struct ShelfConfiguration: Codable, Equatable, Sendable {
         normalize()
     }
 }
+
+/// 自动移除前应用在应用栏或分组里的位置。它很快又装回来时（例如更新程序先删旧包、再放新包）放回这里。
+/// 分组记下名字和它在应用栏里的位置：成员都被移除、分组随之消失后，装回来时按原名原位重建。
+enum ShelfPlacement: Equatable, Sendable {
+    case pinned(index: Int)
+    case group(UUID, name: String, slot: Int, index: Int)
+}
+
+extension ShelfConfiguration {
+    private func contains(_ app: AppReference) -> Bool {
+        items.contains { if case .app(let pinned) = $0 { return pinned.path == app.path }; return false }
+            || groups.contains { $0.apps.contains { $0.path == app.path } }
+    }
+
+    func placement(of app: AppReference) -> ShelfPlacement? {
+        if let index = items.firstIndex(where: { if case .app(let pinned) = $0 { return pinned.path == app.path }; return false }) {
+            return .pinned(index: index)
+        }
+        for group in groups {
+            guard let index = group.apps.firstIndex(where: { $0.path == app.path }) else { continue }
+            let slot = items.firstIndex(of: .group(group.id)) ?? items.count
+            return .group(group.id, name: group.name, slot: slot, index: index)
+        }
+        return nil
+    }
+
+    /// 放回原处；已经在应用栏或分组里就不重复放。分组已随成员移除而消失时，按原名原位重建。
+    @discardableResult
+    mutating func restore(_ app: AppReference, at placement: ShelfPlacement) -> Bool {
+        guard !contains(app) else { return false }
+        switch placement {
+        case .pinned(let index):
+            items.insert(.app(app), at: min(index, items.count))
+        case .group(let id, let name, let slot, let index):
+            if let group = groups.firstIndex(where: { $0.id == id }) {
+                groups[group].apps.insert(app, at: min(index, groups[group].apps.count))
+            } else {
+                groups.append(AppGroup(id: id, name: name, apps: [app]))
+                items.insert(.group(id), at: min(slot, items.count))
+            }
+        }
+        normalize()
+        return true
+    }
+}
+
+enum FolderLayout {
+    /// 应用所在文件夹的监视是递归的：开发目录里的构建、App 自己写缓存等无关写入也会报上来，每次都要重读几十个
+    /// Info.plist、刷新应用栏。只认引用的应用包本身及其内部，和各监视文件夹第一层的 .app（装上、移走、改名）。
+    static func relevantApplicationChanges(_ paths: [String], applications: Set<String>, extraFolders: [String]) -> [String] {
+        let folders = Set(applications.map { ($0 as NSString).deletingLastPathComponent } + extraFolders)
+        return paths.map { $0.hasSuffix("/") ? String($0.dropLast()) : $0 }.filter { path in
+            applications.contains { path == $0 || path.hasPrefix($0 + "/") }
+                || (path.hasSuffix(".app") && folders.contains((path as NSString).deletingLastPathComponent))
+        }
+    }
+}

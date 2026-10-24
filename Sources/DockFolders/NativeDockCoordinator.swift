@@ -24,12 +24,12 @@ struct NativeDockPreferenceValue: Codable, Equatable, Sendable {
         return (left as AnyObject).isEqual(right)
     }
 
-    private static func tileIdentity(_ tiles: [[String: Any]]) -> [String] {
-        tiles.map { tile in
-            let data = tile["tile-data"] as? [String: Any]
-            let url = (data?["file-data"] as? [String: Any])?["_CFURLString"] as? String
-            return [tile["tile-type"] as? String ?? "", data?["bundle-identifier"] as? String ?? "", url ?? ""].joined(separator: "|")
-        }
+    private static func tileIdentity(_ tiles: [[String: Any]]) -> [String] { tiles.map(tileKey) }
+
+    static func tileKey(_ tile: [String: Any]) -> String {
+        let data = tile["tile-data"] as? [String: Any]
+        let url = (data?["file-data"] as? [String: Any])?["_CFURLString"] as? String
+        return [tile["tile-type"] as? String ?? "", data?["bundle-identifier"] as? String ?? "", url ?? ""].joined(separator: "|")
     }
 
     static func encoding(_ value: Any?) throws -> Self {
@@ -127,6 +127,16 @@ enum NativeDockRecovery {
         return try body()
     }
 
+    /// 每次会话一份恢复备份，只留最近 10 份；当前会话的必定保留。必须持有会话锁，且旧的未完成会话已恢复。
+    static func pruneBackups(at location: Location, keeping current: UUID, limit: Int = 10) {
+        let keys: [URLResourceKey] = [.contentModificationDateKey]
+        guard let files = try? FileManager.default.contentsOfDirectory(at: location.backups, includingPropertiesForKeys: keys) else { return }
+        let dated = files.filter { $0.pathExtension == "plist" && $0.lastPathComponent != "\(current.uuidString).plist" }
+            .map { ($0, (try? $0.resourceValues(forKeys: Set(keys)).contentModificationDate) ?? .distantPast) }
+            .sorted { $0.1 > $1.1 }
+        for (file, _) in dated.dropFirst(limit - 1) { try? FileManager.default.removeItem(at: file) }
+    }
+
     static func load(_ url: URL) throws -> NativeDockRecoverySession {
         let value = try PropertyListDecoder().decode(NativeDockRecoverySession.self, from: Data(contentsOf: url))
         let keys = Set(value.changes.map(\.key))
@@ -218,10 +228,28 @@ enum NativeDockRecovery {
     static func restoreCandidates(_ session: NativeDockRecoverySession,
                                   current: [String: NativeDockPreferenceValue]) -> [NativeDockPreferenceChange] {
         session.changes.filter { change in
-            guard session.attemptedKeys.contains(change.key) else { return false }
-            if isManaged(change.key, in: session) { return current[change.key] != change.original }
-            return change.original != change.applied && current[change.key] == change.applied
+            session.attemptedKeys.contains(change.key) && restoreTarget(change, current: current[change.key], in: session) != nil
         }
+    }
+
+    /// 恢复时要写的值；nil 表示保留当前值。影子会话（v3）的固定项若被别的程序改过（例如安装程序往 Dock 里加了自己），
+    /// 原先整份保留，用户原来的固定项就回不来、只剩小间隔加新图标；现在写回原有固定项，再把新加的补在后面。
+    static func restoreTarget(_ change: NativeDockPreferenceChange, current: NativeDockPreferenceValue?,
+                              in session: NativeDockRecoverySession) -> NativeDockPreferenceValue? {
+        if isManaged(change.key, in: session) { return current != change.original ? change.original : nil }
+        guard change.original != change.applied else { return nil }
+        if current == change.applied { return change.original }
+        guard session.version == 3, ["persistent-apps", "persistent-others"].contains(change.key),
+              let current, current != change.original else { return nil }
+        return mergedTiles(original: change.original, current: current)
+    }
+
+    static func mergedTiles(original: NativeDockPreferenceValue, current: NativeDockPreferenceValue) -> NativeDockPreferenceValue? {
+        guard let base = (try? original.decoded()) as? [[String: Any]] ?? (original.data == nil ? [] : nil),
+              let now = (try? current.decoded()) as? [[String: Any]] else { return nil }
+        let known = Set(base.map(NativeDockPreferenceValue.tileKey))
+        let added = now.filter { $0["tile-type"] as? String != "small-spacer-tile" && !known.contains(NativeDockPreferenceValue.tileKey($0)) }
+        return try? .encoding(base + added)
     }
 
     /// 必须持有会话锁。UUID 不匹配时只返回，旧恢复子进程不能覆盖新会话。
@@ -241,15 +269,17 @@ enum NativeDockRecovery {
         let candidates = restoreCandidates(session, current: current)
         session.phase = .restoring
         try save(session, at: location.state)
+        var written: [String: NativeDockPreferenceValue] = [:]
         for change in candidates {
             // 再读一次，缩小与用户手动修改同时发生时的竞争窗口。
             let now = try read(change.key)
-            guard isManaged(change.key, in: session) ? now != change.original : now == change.applied else { continue }
-            try write(change.original, key: change.key)
+            guard let target = restoreTarget(change, current: now, in: session) else { continue }
+            try write(target, key: change.key)
             try synchronize()
-            guard try read(change.key) == change.original else {
+            guard try read(change.key) == target else {
                 throw NativeDockError.message("\(change.key) 恢复后的值核对失败；备份仍然保留。")
             }
+            written[change.key] = target
             if !session.restoredKeys.contains(change.key) { session.restoredKeys.append(change.key) }
             try save(session, at: location.state)
         }
@@ -257,14 +287,15 @@ enum NativeDockRecovery {
             !session.restoredKeys.contains(key) && session.changes.first(where: { $0.key == key })?.original != current[key]
         }
         // 即使上次恢复在写值后崩溃，也需要重新加载 Dock 使已恢复的偏好生效。
-        if !session.attemptedKeys.isEmpty { try restartCurrentUserDock() }
+        if !session.attemptedKeys.isEmpty { try restartCurrentUserDock(expecting: written) }
         session.phase = .inactive
         session.finishedAt = Date()
         try save(session, at: location.state)
         return true
     }
 
-    static func restartCurrentUserDock() throws {
+    /// `expecting`：这次刚写入的值。新 Dock 起来后按它核对，不按杀 Dock 前重读的偏好（那时运行中的 Dock 可能已改写）。
+    static func restartCurrentUserDock(expecting written: [String: NativeDockPreferenceValue] = [:]) throws {
         let intended = try independentPreferences()
         let oldPIDs = Set(NSRunningApplication.runningApplications(withBundleIdentifier: domain).compactMap { app -> Int32? in
             guard DockStopGuardIdentity.captureDock(app.processIdentifier) != nil else { return nil }
@@ -287,8 +318,14 @@ enum NativeDockRecovery {
             let newDock = pids.prefix(max(0, Int(bytes)) / MemoryLayout<pid_t>.size).contains {
                 !oldPIDs.contains($0) && DockStopGuardIdentity.captureDock($0) != nil
             }
-            let actual = try independentPreferences()
-            mismatched = try allowedKeys.filter { try NativeDockPreferenceValue.encoding(actual[$0]) != NativeDockPreferenceValue.encoding(intended[$0]) }.sorted()
+            // 新 Dock 刚起来、系统忙时独立读取可能超时：只算这一轮没稳定，不整体失败。整体失败会让恢复子进程
+            // 0.5 秒后重试，再杀一次刚起来的 Dock。
+            guard let actual = try? independentPreferences() else {
+                stable = 0; Thread.sleep(forTimeInterval: 0.12); continue
+            }
+            mismatched = try allowedKeys.filter { key in
+                try NativeDockPreferenceValue.encoding(actual[key]) != (written[key] ?? NativeDockPreferenceValue.encoding(intended[key]))
+            }.sorted()
             stable = newDock && mismatched.isEmpty ? stable + 1 : 0
             if stable >= 3 { return }
             Thread.sleep(forTimeInterval: 0.12)
@@ -365,7 +402,20 @@ enum NativeDockRecovery {
         session.attemptedKeys.append("tilesize")
         try check(restoreCandidates(session, current: ["autohide": on, "autohide-delay": long, "tilesize": size31]).map(\.key).contains("tilesize"), "运行中调整过的图标尺寸写回原值")
         try check(restoreCandidates(session, current: ["autohide": on, "autohide-delay": long, "tilesize": size37]).count == 2, "图标尺寸已是原值时不重复写")
-        return "通过 20 项恢复 fixture：影子模式固定项按内容比较、v1 两字段与 v2 四字段条件恢复、v4 图标尺寸调整后写回原值、用户更改保留、原缺失键删除、部分写入、备份往返与 PID 身份。未修改系统偏好。"
+        let mail = ["tile-type": "file-tile", "tile-data": ["bundle-identifier": "com.apple.mail"]] as [String: Any]
+        let safari = ["tile-type": "file-tile", "tile-data": ["bundle-identifier": "com.apple.Safari"]] as [String: Any]
+        let installer = ["tile-type": "file-tile", "tile-data": ["bundle-identifier": "us.zoom.xos"]] as [String: Any]
+        let spacerTile = ["tile-type": "small-spacer-tile", "tile-data": [String: Any]()] as [String: Any]
+        let pinned = try NativeDockPreferenceValue.encoding([mail, safari])
+        let tiles = NativeDockPreferenceChange(key: "persistent-apps", original: pinned, applied: spacer)
+        session = NativeDockRecoverySession(version: 3, id: UUID(), mainPID: getpid(),
+            mainIdentity: processIdentity(getpid()) ?? "test", userID: getuid(), createdAt: Date(),
+            changes: [tiles], phase: .active, attemptedKeys: ["persistent-apps"], restoredKeys: [], preservedKeys: [])
+        try check(restoreTarget(tiles, current: spacer, in: session) == pinned, "影子会话固定项未被改动时写回原值")
+        try check(restoreTarget(tiles, current: try .encoding([spacerTile, installer]), in: session) == (try .encoding([mail, safari, installer])),
+                  "安装程序加进 Dock 的图标补在原有固定项后面")
+        try check(restoreTarget(tiles, current: pinned, in: session) == nil, "已是原值时不重复写")
+        return "通过 23 项恢复 fixture：影子会话固定项被改过时合并写回、影子模式固定项按内容比较、v1 两字段与 v2 四字段条件恢复、v4 图标尺寸调整后写回原值、用户更改保留、原缺失键删除、部分写入、备份往返与 PID 身份。未修改系统偏好。"
     }
 }
 
@@ -405,7 +455,7 @@ final class NativeDockCoordinator {
                 let previous = try NativeDockRecovery.load(location.state)
                 if previous.phase != .inactive {
                     guard !NativeDockRecovery.ownerIsAlive(previous) else {
-                        throw NativeDockError.message("另一个 Dock 文件夹会话正在管理系统 Dock。")
+                        throw NativeDockError.message("另一个 DockApex 会话正在管理系统 Dock。")
                     }
                     try NativeDockRecovery.restoreLocked(at: location, expectedID: previous.id)
                 }
@@ -449,6 +499,7 @@ final class NativeDockCoordinator {
                                                    phase: .prepared, attemptedKeys: [], restoredKeys: [], preservedKeys: [])
             try NativeDockRecovery.save(session, at: location.backup(id))
             try NativeDockRecovery.save(session, at: location.state)
+            NativeDockRecovery.pruneBackups(at: location, keeping: id)
         }
         sessionID = id
         do {

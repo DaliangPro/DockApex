@@ -7,8 +7,8 @@ import ApplicationServices
 /// 补底画面来自屏幕捕捉，仅覆盖系统 Dock 那一条区域，只在内存中使用，不保存、不上传。
 @MainActor
 final class ShadowDockController: NSObject {
-    private let base = ShadowPatch(title: "Dock 文件夹 · 补底", level: NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1))
-    private let label = ShadowPatch(title: "Dock 文件夹 · 标签遮盖", level: NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1), masked: true)
+    private let base = ShadowPatch(title: "DockApex · 补底", level: NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1))
+    private let label = ShadowPatch(title: "DockApex · 标签遮盖", level: NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1), masked: true)
     /// 指针在系统 Dock 图标区移动时，移动事件被拦截，应用读到的指针位置不再更新；
     /// 这里把拦截到的真实位置（AppKit 屏幕坐标）交给应用栏。
     var onPointerInDock: ((CGPoint) -> Void)?
@@ -851,11 +851,25 @@ enum ShadowDockGeometry {
     }
 
     /// 在边缘外侧持续推指针，让系统 Dock 按原生规则迁移到该屏，随后把指针放回原处。
+    /// 进行中的推边：退出时要停下并把指针放回原处，否则进程退出后指针停在屏幕边上（10-24 实测遇到）。
+    private final class PushState: @unchecked Sendable {
+        let lock = NSLock()
+        var cancelled = false
+        var original: CGPoint?
+    }
+    private static let pushState = PushState()
+
     static func push(at point: CGPoint, orientation: DockPosition, restorePointer: Bool, count: Int = 40) {
         let primaryHeight = CGDisplayBounds(CGMainDisplayID()).height
         let quartz = CGPoint(x: point.x, y: orientation == .bottom ? primaryHeight - point.y - 1 : primaryHeight - point.y)
         let original = CGEvent(source: nil)?.location
+        pushState.lock.withLock { pushState.cancelled = false; pushState.original = restorePointer ? original : nil }
         for index in 0..<count {
+            // 退出时 cancelPush 已先放回一次；这里可能刚又推了一下，停下前再放回一次。
+            if pushState.lock.withLock({ pushState.cancelled }) {
+                if restorePointer, let original { CGWarpMouseCursorPosition(original); CGAssociateMouseAndMouseCursorPosition(1) }
+                return
+            }
             guard let event = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition:
                     CGPoint(x: quartz.x + CGFloat(index % 2), y: quartz.y), mouseButton: .left) else { continue }
             switch orientation {
@@ -866,7 +880,18 @@ enum ShadowDockGeometry {
             event.post(tap: .cghidEventTap)
             usleep(12_000)
         }
-        if restorePointer, let original { CGWarpMouseCursorPosition(original); CGAssociateMouseAndMouseCursorPosition(1) }
+        let restore = pushState.lock.withLock { () -> CGPoint? in defer { pushState.original = nil }; return pushState.original }
+        if let restore { CGWarpMouseCursorPosition(restore); CGAssociateMouseAndMouseCursorPosition(1) }
+    }
+
+    /// 开始退出时调用：停下进行中的推边，把借用的指针放回原处。
+    static func cancelPush() {
+        let restore = pushState.lock.withLock { () -> CGPoint? in
+            pushState.cancelled = true
+            defer { pushState.original = nil }
+            return pushState.original
+        }
+        if let restore { CGWarpMouseCursorPosition(restore); CGAssociateMouseAndMouseCursorPosition(1) }
     }
 }
 

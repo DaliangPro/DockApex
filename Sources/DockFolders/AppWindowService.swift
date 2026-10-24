@@ -277,6 +277,22 @@ actor AppWindowReader {
         return AppWindowActionResult(succeeded: true, errorDescription: nil)
     }
 
+    /// 按窗口自己的关闭按钮，与点红色按钮相同：有未存内容时由应用自己弹出存储提示，窗口留着。
+    func close(windowID: String, processIdentifier pid: pid_t) -> AppWindowActionResult {
+        guard !Task.isCancelled, let token = AppWindowProcessIdentity.token(pid), token == elementIdentities[pid],
+              let window = elements[pid]?[windowID] else {
+            return AppWindowActionResult(succeeded: false, errorDescription: "窗口已关闭。")
+        }
+        AXUIElementSetMessagingTimeout(window, timeout)
+        var button: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXCloseButtonAttribute as CFString, &button) == .success,
+              let button, CFGetTypeID(button) == AXUIElementGetTypeID() else {
+            return AppWindowActionResult(succeeded: false, errorDescription: "这个窗口没有关闭按钮。")
+        }
+        let result = AXUIElementPerformAction(button as! AXUIElement, kAXPressAction as CFString)
+        return AppWindowActionResult(succeeded: result == .success, errorDescription: result == .success ? nil : describe(result))
+    }
+
     func restoreIfAllMinimized(processIdentifier pid: pid_t, applicationName: String) async -> AppWindowActionResult {
         let current = scan(processIdentifier: pid, applicationName: applicationName)
         guard current.isComplete, !current.windows.isEmpty, current.windows.allSatisfy(\.isMinimized) else {
@@ -314,7 +330,13 @@ final class AppWindowService {
     private var trackedTokens: [pid_t: String] = [:]
     private var observerRefreshes: [pid_t: Task<Void, Never>] = [:]
     private var dirty = Set<Identity>()
-    var onChange: (() -> Void)?
+    /// 窗口有变化；参数为应用栏要显示的最小化窗口（编号与标题）是否变了。移动、改尺寸、改标题、换焦点只需
+    /// 窗口避让重新看一轮，不必刷新整条应用栏。
+    var onChange: ((_ minimizedChanged: Bool) -> Void)?
+
+    static func minimizedKeys(_ windows: [AppWindowInfo]) -> [String] {
+        windows.filter(\.isMinimized).map { $0.id + "\t" + $0.title }
+    }
     /// 最小化通知不等 60ms 列表去抖，避免窗口消失后再开始过渡。
     var onMinimizationEvent: ((AppWindowMinimizationEvent) -> Void)?
     /// 返回 true 表示先播放截图恢复动画，再调用 completion 执行真实 AX 恢复。
@@ -355,7 +377,9 @@ final class AppWindowService {
         for pid in Array(observerRefreshes.keys) where next[pid] == nil { observerRefreshes.removeValue(forKey: pid)?.cancel() }
         let pids = Set(next.keys)
         if oldTrackedPIDs != pids { Task { [reader] in await reader.retainProcesses(pids) } }
-        if oldEntries.contains(where: { !$0.snapshot.windows.isEmpty }) { onChange?() }
+        if oldEntries.contains(where: { !$0.snapshot.windows.isEmpty }) {
+            onChange?(oldEntries.contains { $0.snapshot.windows.contains(where: \.isMinimized) })
+        }
         for app in next.values {
             if force || cachedWindows(for: app).map({ Date().timeIntervalSince($0.updatedAt) >= 8 }) ?? true { refresh(app) }
         }
@@ -373,7 +397,7 @@ final class AppWindowService {
             let cancelled = unavailableSnapshot(identity.pid, message: "窗口读取已停止。")
             for handler in handlers { handler(cancelled) }
         }
-        if hadWindows { onChange?() }
+        if hadWindows { onChange?(true) }
     }
 
     fileprivate func receiveAccessibilityChange(processIdentifier pid: pid_t, notification: String, windowID rawWindowID: String, cgWindowID: CGWindowID?) {
@@ -396,7 +420,7 @@ final class AppWindowService {
                         hasAccessibilityPermission: entry.snapshot.hasAccessibilityPermission,
                         errorDescription: entry.snapshot.errorDescription, updatedAt: Date(), isComplete: entry.snapshot.isComplete), processIdentity: entry.processIdentity)
                 // 先让栏内出现真实最小化窗口入口，后取动画终点；完整 AX 复查仍由下方去抖执行。
-                onChange?()
+                onChange?(true)
             }
             onMinimizationEvent?(AppWindowMinimizationEvent(application: app, windowID: windowID,
                 isMinimized: minimized, previousWindow: previousWindow, occurredAt: Date(),
@@ -409,7 +433,7 @@ final class AppWindowService {
                     snapshot: AppWindowSnapshot(processIdentifier: pid, windows: windows,
                         hasAccessibilityPermission: entry.snapshot.hasAccessibilityPermission,
                         errorDescription: entry.snapshot.errorDescription, updatedAt: Date(), isComplete: entry.snapshot.isComplete), processIdentity: token)
-                onChange?()
+                onChange?(Self.minimizedKeys(windows) != Self.minimizedKeys(entry.snapshot.windows))
             }
         }
         guard observerRefreshes[pid] == nil else { return }
@@ -460,7 +484,7 @@ final class AppWindowService {
             requestIDs[identity] = nil
             let callbacks = completions.removeValue(forKey: identity) ?? []
             for callback in callbacks { callback(result) }
-            if old != result.windows { onChange?() }
+            if old != result.windows { onChange?(Self.minimizedKeys(old) != Self.minimizedKeys(result.windows)) }
             if dirty.remove(identity) != nil { refresh(app) }
         }
     }
@@ -509,6 +533,18 @@ final class AppWindowService {
         }
         if window.isMinimized, animateRestore?(app, window, performRestore) == true { return }
         performRestore()
+    }
+
+    /// 关闭窗口（窗口预览里的关闭按钮）：不激活应用，结果回到主线程。
+    func close(_ window: AppWindowInfo, in app: AppReference, completion: @escaping @MainActor (AppWindowActionResult) -> Void) {
+        guard let running = ShelfAppActions.running(app) else {
+            completion(AppWindowActionResult(succeeded: false, errorDescription: "应用已退出。"))
+            return
+        }
+        let pid = running.processIdentifier
+        Task { @MainActor [reader] in
+            completion(await reader.close(windowID: window.id, processIdentifier: pid))
+        }
     }
 
     func restoreIfAllMinimized(_ app: AppReference, interaction existing: ShelfInteractionToken? = nil) {

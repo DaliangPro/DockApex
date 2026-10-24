@@ -32,7 +32,12 @@ final class DockSystemRegionController {
     private(set) var lastError: String?
     private(set) var activeDisplayUUID: String?
     private(set) var activeReservedArea: DockReservedArea?
-    var isApplied: Bool {
+    /// 上次进锁核对系统预留区的时刻。刷新应用栏很频繁，每次都同步读 WindowServer 时，它一忙主线程就要等几十到几百毫秒。
+    private var lastVerified: TimeInterval = 0
+    /// 按最近一次登记的结果判断，不读 WindowServer。
+    var isApplied: Bool { activeDisplayUUID != nil && lastAppliedValue != nil }
+    /// 实时读一次系统预留区核对，只在明确要诊断时用。
+    func verifyApplied() -> Bool {
         guard activeDisplayUUID != nil, let lastAppliedValue, let api, let current = try? api.read() else { return false }
         return current.matches(lastAppliedValue)
     }
@@ -78,6 +83,14 @@ final class DockSystemRegionController {
             }
             let requested = try DockSystemRegionValue.reservation(screenFrame: area.screenFrame, reservedFrame: area.reservedFrame,
                                                                  primaryHeight: primaryHeight, edge: edge)
+            // 区域没变且 2 秒内核对过就不再进锁、读 WindowServer；系统 Dock 改写预留区最迟在 2 秒后的下一次刷新时
+            // 发现（10 秒定时刷新兜底）。
+            let now = ProcessInfo.processInfo.systemUptime
+            if requested == lastAppliedValue, activeDisplayUUID == area.displayUUID, sessionID != nil, watchdog?.isRunning == true,
+               now - lastVerified < 2 {
+                activeReservedArea = area
+                return true
+            }
             let api = try obtainAPI()
             try ensureSession(api: api)
             guard let id = sessionID else { throw DockSystemRegionError.message("预留区会话没有建立。") }
@@ -100,9 +113,11 @@ final class DockSystemRegionController {
                 }
             }
             activeDisplayUUID = area.displayUUID; activeReservedArea = area; lastAppliedValue = requested; lastError = nil
+            lastVerified = now
             return true
         } catch {
             activeDisplayUUID = nil; activeReservedArea = nil; lastAppliedValue = nil; lastError = error.localizedDescription
+            lastVerified = 0
             NSLog("Dock 系统预留区：%@", error.localizedDescription)
             return false
         }
