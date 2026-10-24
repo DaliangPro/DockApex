@@ -5,7 +5,7 @@ import AppKit
 /// 应用栏和分组面板里的 App 都支持。预览开着时移到别的 App 立即换内容；指针离开图标、预览和两者之间的通道 0.25 秒后收起。
 /// 与右键菜单一样用系统弹出框承载：弹出、收起动画，箭头和材质都和右键菜单一致。
 /// 缩略图只在悬停时用 ScreenCaptureKit 截取单个窗口，只存在内存里（不存盘、不上传），窗口关掉或 App 退出就丢掉；
-/// 最小化的窗口截不到画面，沿用最小化前最后一张，没有就显示 App 图标。
+/// 最小化的窗口照样截（单窗口截取在最小化后仍能拿到画面，10-24 实测）；截到全透明的空画面就沿用上一张，没有就显示 App 图标。
 @MainActor
 final class WindowPreviewController: NSObject, NSPopoverDelegate {
     static let shared = WindowPreviewController()
@@ -175,10 +175,10 @@ final class WindowPreviewController: NSObject, NSPopoverDelegate {
         if let since = outsideSince { if now - since > 0.25 { hide() } } else { outsideSince = now }
     }
 
-    /// 后台逐个截取未最小化的窗口（单窗口截取，不含阴影，长边 480 像素），截到一张就换上一张。
+    /// 后台逐个截取窗口，含最小化的（单窗口截取，不含阴影，长边 480 像素），截到一张就换上一张。
     private func capture(_ windows: [AppWindowInfo], pid: pid_t, token: Int) {
         captureTask?.cancel()
-        let targets = windows.filter { !$0.isMinimized }.compactMap { info in info.cgWindowID.map { (number: $0, frame: info.quartzFrame) } }
+        let targets = windows.compactMap { info in info.cgWindowID.map { (number: $0, frame: info.quartzFrame) } }
         guard !targets.isEmpty else { return }
         captureTask = Task { [weak self] in
             guard let content = try? await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false) else { return }
@@ -194,10 +194,21 @@ final class WindowPreviewController: NSObject, NSPopoverDelegate {
                 configuration.ignoreShadowsSingleWindow = true; configuration.shouldBeOpaque = false
                 guard let image = try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: window),
                                                                               configuration: configuration),
-                      let self, !Task.isCancelled else { continue }
+                      Self.hasVisiblePixels(image), let self, !Task.isCancelled else { continue }
                 self.thumbnails[target.number] = (pid, image)
                 if self.generation == token { self.grid?.setThumbnail(image, for: target.number) }
             }
+        }
+    }
+
+    /// 缩到 8×8 看有没有不透明的点。
+    private static func hasVisiblePixels(_ image: CGImage) -> Bool {
+        var pixels = [UInt8](repeating: 0, count: 8 * 8 * 4)
+        return pixels.withUnsafeMutableBytes { buffer in
+            guard let context = CGContext(data: buffer.baseAddress, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 32,
+                                          space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return true }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: 8, height: 8))
+            return stride(from: 3, to: buffer.count, by: 4).contains { buffer[$0] > 8 }
         }
     }
 
@@ -299,7 +310,7 @@ private final class WindowPreviewTile: NSView {
 
     required init?(coder: NSCoder) { nil }
 
-    /// 有画面就等比放进缩略图框；没有（最小化前没截到、截取失败）就在框中间放 App 图标。
+    /// 有画面就等比放进缩略图框；没有（还没截到、截取失败）就在框中间放 App 图标。
     func setImage(_ image: CGImage?) {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         let box = CGRect(origin: .zero, size: Self.thumbnail)
