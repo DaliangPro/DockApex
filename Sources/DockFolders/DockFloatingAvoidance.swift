@@ -39,6 +39,12 @@ final class DockFloatingAvoidance: @unchecked Sendable {
     private var workspaceObservers: [NSObjectProtocol] = []
     private var scanQueued = false
     private var forwardQueued = false
+    /// 应用栏在动时把扫描往后推：取窗口列表要先等 WindowServer 处理完本应用刚提交的界面改动，等的时候一直占着
+    /// 窗口服务连接锁，主线程下一次提交界面只能干等（10-25 卡顿栈：拖设置菜单滑块时主线程卡 0.51 秒，占锁的正是这里）。
+    /// 悬停期间一直推，刷新应用栏后推 0.5 秒；伸进应用栏的浮窗因此最多晚半秒挪开。
+    private let holdLock = NSLock()
+    private var heldWhileHovering = false
+    private var heldUntil: TimeInterval = 0
     /// 窗口事件同时转给大窗口避让（在主线程调用，最多每 30 毫秒一次），不必等窗口缓存刷新。
     var onWindowEvent: (@MainActor () -> Void)?
 
@@ -121,6 +127,26 @@ final class DockFloatingAvoidance: @unchecked Sendable {
 
     var summary: Report { reportLock.withLock { report } }
 
+    func holdScans(for seconds: TimeInterval) {
+        let until = ProcessInfo.processInfo.systemUptime + seconds
+        holdLock.withLock { heldUntil = max(heldUntil, until) }
+    }
+
+    /// 指针在应用栏上（悬停放大一直在提交界面）时暂停扫描，离开后再等 0.5 秒放大收回。
+    func setHeldWhileHovering(_ held: Bool) {
+        holdLock.withLock { heldWhileHovering = held }
+        if !held { holdScans(for: 0.5) }
+    }
+
+    /// 还要等多久才能扫；nil 表示现在就能扫。
+    private var holdRemaining: TimeInterval? {
+        holdLock.withLock {
+            if heldWhileHovering { return 0.3 }
+            let remaining = heldUntil - ProcessInfo.processInfo.systemUptime
+            return remaining > 0 ? remaining : nil
+        }
+    }
+
     /// 占位区为空即停止扫描。
     func update(zones: [DockWorkAreaZone]) {
         queue.async { [self] in
@@ -138,6 +164,13 @@ final class DockFloatingAvoidance: @unchecked Sendable {
     func stop() { update(zones: []) }
 
     private func scan() {
+        if let wait = holdRemaining {
+            if !scanQueued {
+                scanQueued = true
+                queue.asyncAfter(deadline: .now() + wait) { [self] in scanQueued = false; scan() }
+            }
+            return
+        }
         guard !zones.isEmpty, AXIsProcessTrusted(),
               CGEventSource.buttonState(.combinedSessionState, button: .left) == false,
               let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return }

@@ -79,6 +79,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 最近一次对齐量过的布局，以及这个布局下量过的 图标尺寸 → 废纸篓横向差。布局不变就不再对齐；
     /// 量过且不比现在准的尺寸不再回去：尺寸只能取整数，理想值落在两个整数之间时会在两边来回改（10-23 实测累计 1069 次）。
     private var hiddenDockAlignedLayout = ""
+    /// 本应用最后一次给藏着的系统 Dock 设的图标尺寸；读到别的值就是用户在系统设置里拖了“大小”滑块。
+    private var hiddenTileSizeSet: Double?
+    /// 上次读到的系统 Dock 图标尺寸（启动后第一次读到的只作基准，不当作用户改动）。
+    private var lastSeenDockTileSize: Double?
+    /// 用户最近一次拖“大小”滑块的时刻：停手 1.5 秒内不对齐，免得和滑块抢；跟随记录也等停手后再写一条。
+    private var userTileSizeChangedAt: TimeInterval?
+    private var nativeSettingsLog: DispatchWorkItem?
     private var hiddenDockErrors: [Double: Double] = [:]
     /// 对齐时最近一次量到的隐藏系统 Dock（仅诊断用；诊断随每次刷新写出，不能在主线程现读辅助功能）。
     private var hiddenDockSummary = ""
@@ -222,6 +229,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.shadowDock.setBarVisible(self.bar.isAnyBarPresented)
                 self.shadowDock.setNear(self.bar.isAnyBarNear)
                 self.shadowDock.setHovering(self.bar.isAnyBarHovered)
+                self.floatingAvoidance.setHeldWhileHovering(self.bar.isAnyBarHovered)
                 if self.bar.isAnyBarHovered { self.refreshHoveredWindowCaches() }
             }
             bar.onMenuState = { [weak self] open in self?.shadowDock.setMenuOpen(open) }
@@ -243,6 +251,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 Task { @MainActor [weak self] in self?.followNativeSettings(values) }
             }
             dockSettings?.start()
+            // 系统设置在前台时直接向系统 Dock 实时读，拖滑块时应用栏跟着变；离开系统设置就停。
+            let settingsID = "com.apple.systempreferences"
+            dockSettings?.setLive(NSWorkspace.shared.frontmostApplication?.bundleIdentifier == settingsID)
+            runtimeObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+                let active = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier == settingsID
+                MainActor.assumeIsolated { self?.dockSettings?.setLive(active) }
+            })
             ShelfRunningApplications.shared.onRegularTerminated = { [weak self] app in self?.rememberRecentApplication(app) }
             ShelfRunningApplications.shared.onChange = { [weak self] in
                 guard let self, !self.isEnding, self.terminationTask == nil else { return }
@@ -259,20 +275,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             GroupPanelController.log = { [weak self] message in self?.log.record(message) }
             DockMotionSurface.logDrop = { [weak self] message in self?.log.record(message) }
-            NativeDockMenuMirror.patchFrame = { [weak self] in self?.shadowDock.patchFrame }
-            NativeDockMenuMirror.dockScreen = { [weak self] in
-                guard let self, nativeDock.shadow == nil, let uuid = hiddenDockScreenUUID else { return nil }
-                return NSScreen.screens.first { DockDisplayDescriptor.uuid(for: $0) == uuid }
-            }
             DockMotionSurface.previewGroupIncoming = { [weak self] point in self?.panel.previewIncoming(at: point) }
             DockMotionSurface.groupIncomingLanding = { [weak self] in self?.panel.incomingLandingRect() }
             GroupPanelController.referenceDragMoved = { [weak self] point in self?.bar.updateReferenceDrag(at: point) }
             GroupPanelController.referenceDropped = { [weak self] url, point in self?.bar.dropReference(url, at: point) ?? false }
-            DockMotionSurface.prepareMenu = { [weak self] id, done in
-                guard let self, case .app(let app) = self.item(id), ShelfAppActions.running(app) != nil else { done(); return }
-                let titles = Set(AppWindowService.shared.cachedWindows(for: app)?.windows.map(\.title) ?? [])
-                NativeDockMenuMirror.shared.prepare(app, windowTitles: titles, completion: done)
-            }
             nativeStatusSource.start()
             fullscreenTracker.start()
             AppWindowService.shared.onChange = { [weak self] minimizedChanged in
@@ -441,13 +447,25 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             minimizeToApplication: (preference("minimize-to-application") as? Bool) ?? false)
     }
 
-    /// 系统设置里改了程序坞的放大、运行指示、启动动画或最小化方式：经典模式下应用栏跟着变，这几项本应用菜单里没有开关。
+    /// 系统设置里改了程序坞的大小、放大、运行指示、启动动画或最小化方式：经典模式下应用栏跟着变。
     /// 影子 Dock 会改写放大、退出时又写回原值，那些时候不跟随。不算一步可撤销的布局更改。
     private func followNativeSettings(_ values: NativeDockSettingsWatcher.Values) {
         guard let store, !usesNativeHost, canAdjustHiddenDock else { return }
         var next = store.configuration
         var options = next.options ?? nativeOptions()
         let before = options
+        // “大小”：系统 Dock 的图标尺寸平时由本应用调来对准最小化落点。读到的既不是上次的值、也不是本应用设的值，
+        // 就是用户拖了滑块：应用栏图标跟着变，停手后再把系统 Dock 调回对准落点的尺寸，滑块随之跳回（10-25 用户选定）。
+        // 启动后第一次读到的只作基准。
+        if let tile = values.tileSize {
+            let previous = lastSeenDockTileSize
+            lastSeenDockTileSize = tile
+            if let previous, abs(tile - previous) >= 1, hiddenTileSizeSet.map({ abs(tile - $0) >= 1.5 }) ?? true {
+                options.iconSize = min(max(tile, 16), 128)
+                userTileSizeChangedAt = ProcessInfo.processInfo.systemUptime
+                do { try nativeDock.updateOriginal("tilesize", to: tile) } catch { log?.record("未更新系统 Dock 图标尺寸的原值：\(error.localizedDescription)") }
+            }
+        }
         options.magnification = values.magnification
         options.maximumIconSize = max(values.largeSize, options.iconSize)
         options.showRunningIndicators = values.showRunningIndicators
@@ -457,11 +475,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard options != before else { return }
         next.options = options
         do { try store.save(next, recordUndo: false) } catch { log?.record("跟随系统设置失败：\(error.localizedDescription)"); return }
-        func onOff(_ value: Bool) -> String { value ? "开" : "关" }
-        log?.record("系统设置里的程序坞选项变了，应用栏已跟随：放大 \(onOff(options.magnification))（\(Int(options.maximumIconSize)) 点）、"
-            + "运行指示 \(onOff(options.showRunningIndicators))、启动动画 \(onOff(options.animateLaunching))、"
-            + "最小化到应用程序图标 \(onOff(options.minimizeToApplication == true))")
         refreshBar()
+        // 拖滑块时每 0.2 秒都可能变一次，记录等停下 1 秒后写一条。
+        nativeSettingsLog?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let options = self.store?.configuration.options else { return }
+            func onOff(_ value: Bool) -> String { value ? "开" : "关" }
+            self.log?.record("系统设置里的程序坞选项变了，应用栏已跟随：大小 \(Int(options.iconSize)) 点、放大 \(onOff(options.magnification))"
+                + "（\(Int(options.maximumIconSize)) 点）、运行指示 \(onOff(options.showRunningIndicators))、启动动画 \(onOff(options.animateLaunching))、"
+                + "最小化到应用程序图标 \(onOff(options.minimizeToApplication == true))")
+        }
+        nativeSettingsLog = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
     }
 
     private func nativeFiles() -> [ShelfFile] {
@@ -485,6 +510,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         runtimeObservers.append(DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("io.daliang.dockfolders.sweep-benchmark"), object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.bar.runSweepBenchmark(duration: 3) }
+        })
+        // 本机验收：收起应用栏弹出的右键菜单。测试脚本弹出菜单后用它关掉，不用发按键、也不用点别处
+        // （10-25 点应用栏空白处收菜单时，图标正在放大，点到了访达）。
+        runtimeObservers.append(DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("io.daliang.dockfolders.close-menus"), object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { DockMenuPopover.shared.close() }
         })
         // 分组图标先用了旧图（成员还没按当前外观预取好）时，预取完再刷新一次，换上新图。
         DockIconProvider.shared.onGroupIconsWarmed = { [weak self] in self?.refreshBar() }
@@ -762,6 +793,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 改尺寸会把系统 Dock 弹出来，随即重新开启自动隐藏就不会露出（实测每 20ms 采样始终在屏外）。尺寸只能取整数，误差约 ±7 点。
     /// 只处理底部；系统 Dock 不在应用栏所在屏时不对齐（换屏成功后会再调用）。尺寸退出或崩溃时由恢复会话写回原值。
     private func alignHiddenDock(round: Int = 0) {
+        // 用户正在系统设置里拖“大小”滑块（停手不到 1.5 秒）：先不对齐，免得和滑块抢，停手后再对齐。
+        if let changed = userTileSizeChangedAt, case let elapsed = ProcessInfo.processInfo.systemUptime - changed, elapsed < 1.5 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6 - elapsed) { [weak self] in self?.alignHiddenDock(round: round) }
+            return
+        }
         guard hasEnteredDock, nativeDock.shadow == nil, !relocatingHiddenDock, let store, store.configuration.position == .bottom,
               let uuid = bar.activeDisplayUUID,
               let ours = bar.restingRect(for: "system:trash") else { return }
@@ -788,6 +824,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.log?.record("未调整隐藏系统 Dock 的图标尺寸：\(error.localizedDescription)")
                     return
                 }
+                self.hiddenTileSizeSet = next
                 CoreDockTileSize.set(next)
                 CoreDockAutoHide.set(true)
                 self.log?.record(String(format: "隐藏的系统 Dock 图标尺寸 %.0f → %.0f，对齐前废纸篓横向差 %.0f 点", size, next, actual - wanted))
@@ -818,8 +855,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateShadowTarget() {
         guard let store else { return }
         let mode = store.configuration.options?.displayMode ?? .followPointer
-        NativeDockMenuMirror.shared.enabled = nativeDock.shadow != nil
-            || (!relocatingHiddenDock && hiddenDockScreenUUID != nil && hiddenDockScreenUUID == bar.activeDisplayUUID)
         guard nativeDock.shadow != nil else { updateClassicEdgeGuard(); return }
         // 同时显示时不主动挪动系统 Dock，避免在两屏间来回推指针；补底跟随系统 Dock 所在屏。
         shadowDock.setTarget(displayUUID: mode == .all ? nil : bar.activeDisplayUUID, locked: mode == .primary || mode == .specific)
@@ -847,6 +882,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refreshBar() {
         guard let store, !isEnding else { return }
+        // 应用栏要重排，悬浮窗避让的扫描先让一让（见 DockFloatingAvoidance.holdScans）。
+        floatingAvoidance.holdScans(for: 0.5)
         if usesNativeHost {
             displayItems = store.configuration.items
             for app in nativeHost?.applicationReferences ?? [] where !displayItems.contains(where: { $0.id == ShelfItem.app(app).id }) {
@@ -1021,8 +1058,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "windowPreview": WindowPreviewController.shared.summary,
             "floatingAvoidance": { let r = floatingAvoidance.summary; return ["moved": r.moved, "released": r.released, "lastApp": r.lastApp] }(),
             // 经典模式下系统 Dock 藏着，用它的辅助功能外框判断停在哪块屏（最小化会缩向那里）。
-            "hiddenSystemDock": hiddenDockSummary,
-            "menuMirrorTiming": NativeDockMenuMirror.shared.lastTiming
+            "hiddenSystemDock": hiddenDockSummary
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys]), data != lastRuntimeDiagnostics else { return }
         let directory = store.root.appendingPathComponent("Diagnostics", isDirectory: true)
@@ -1563,18 +1599,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         recents.state = store?.configuration.options?.showRecentApplications != false ? .on : .off
         menu.addItem(recents)
-        let sizeMenu = NSMenuItem(title: "图标大小", action: nil, keyEquivalent: "")
-        let sizes = NSMenu()
-        for value in [28.0, 37.0, 48.0, 64.0] {
-            let choice = ShelfMenuItem("\(Int(value)) 点") { [weak self] in
-                guard let self else { return }; var next = self.store.configuration; var options = next.options ?? self.nativeOptions()
-                options.iconSize = value; options.maximumIconSize = max(options.maximumIconSize, value)
-                next.options = options; self.panel.hide(); self.apply(next, message: "图标大小已更新。")
-            }
-            choice.state = store?.configuration.options?.iconSize == value ? .on : .off
-            sizes.addItem(choice)
+        // 与系统设置里程序坞的“大小”“放大”滑块对应，拖动时应用栏实时变（10-25 用户要求）。“悬停放大”拖到最左为关。
+        // 名称按用户要求写明各管什么：一个是 Dock 平时多大，一个是指针停上去时图标放大到多大。
+        let current = store?.configuration.options ?? nativeOptions()
+        let sizeItem = NSMenuItem()
+        sizeItem.identifier = NSUserInterfaceItemIdentifier("size-slider")
+        sizeItem.view = ShelfMenuSlider(title: "Dock 大小", value: current.iconSize, range: 16...128) { [weak self, weak sizeItem] value, finished in
+            self?.sizeSliderChanged(value.rounded(), finished: finished, in: sizeItem?.menu)
         }
-        sizeMenu.submenu = sizes; menu.addItem(sizeMenu)
+        menu.addItem(sizeItem)
+        let magnificationItem = NSMenuItem()
+        magnificationItem.identifier = NSUserInterfaceItemIdentifier("magnification-slider")
+        magnificationItem.view = ShelfMenuSlider(title: "悬停放大", value: current.magnification ? current.maximumIconSize : current.iconSize,
+                                                 range: current.iconSize...128) { [weak self] value, finished in
+            self?.magnificationSliderChanged(value.rounded(), finished: finished)
+        }
+        menu.addItem(magnificationItem)
         let login = ShelfMenuItem("登录时打开") { [weak self] in
             do { try LoginItemService.toggle(); self?.log.record("登录时打开：\(LoginItemService.statusText)") }
             catch { self?.showError(error) }
@@ -1815,9 +1855,72 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     continue
                 }
             }
+            if let view = item.view as? ShelfMenuSlider, let fresh = next.view as? ShelfMenuSlider {
+                view.update(value: fresh.slider.doubleValue, range: fresh.slider.minValue...fresh.slider.maxValue)
+            }
             if let submenu = item.submenu, let nextSubmenu = next.submenu { updateMenuStates(submenu, from: nextSubmenu) }
         }
     }
+
+    /// 菜单滑块：一次拖动只记一步撤销（上次拖动停下超过 1 秒才算新的一次）；拖动中最多每 0.05 秒刷新一次应用栏。
+    private var sliderChangedAt: TimeInterval = 0
+    private var sliderRefresh: DispatchWorkItem?
+    private func applySlider(finished: Bool, message: String, _ change: (inout ShelfOptions) -> Void) {
+        guard let store else { return }
+        var next = store.configuration
+        var options = next.options ?? nativeOptions()
+        change(&options)
+        guard options != next.options else { return }
+        next.options = options
+        let now = ProcessInfo.processInfo.systemUptime
+        do { try store.save(next, recordUndo: now - sliderChangedAt > 1) } catch { showError(error); return }
+        sliderChangedAt = now
+        if sliderRefresh == nil || finished {
+            sliderRefresh?.cancel()
+            let work = DispatchWorkItem { [weak self] in self?.sliderRefresh = nil; self?.refreshBar() }
+            sliderRefresh = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + (finished ? 0 : 0.05), execute: work)
+        }
+        if finished { log?.record(message) }
+    }
+
+    private func sizeSliderChanged(_ value: Double, finished: Bool, in menu: NSMenu?) {
+        // 只改应用栏；放大尺寸小于图标大小时等于不放大，与原生一致。系统 Dock 的大小留给对准最小化落点用，不写。
+        applySlider(finished: finished, message: "Dock 大小改为 \(Int(value)) 点。") { options in options.iconSize = value }
+        // “放大”滑块的最左端是当前图标大小（再往左就是不放大），跟着调。
+        if let options = store?.configuration.options,
+           let slider = menu?.items.first(where: { $0.identifier?.rawValue == "magnification-slider" })?.view as? ShelfMenuSlider {
+            slider.update(value: options.magnification ? options.maximumIconSize : options.iconSize, range: options.iconSize...128)
+        }
+    }
+
+    private func magnificationSliderChanged(_ value: Double, finished: Bool) {
+        var enabled = false, size = 0.0
+        applySlider(finished: finished, message: "悬停放大改为 \(value > (store?.configuration.options?.iconSize ?? 0) ? "\(Int(value)) 点" : "关")。") { options in
+            enabled = value > options.iconSize
+            options.magnification = enabled
+            if enabled { options.maximumIconSize = value }
+            size = options.maximumIconSize
+        }
+        // 写给系统 Dock，跟随系统设置时读回来的是同一个值；影子模式下系统 Dock 的放大由会话管着，不写。
+        // 拖动中最多每 0.1 秒写一次，松手时立即写。
+        guard canAdjustHiddenDock, !usesNativeHost, store?.configuration.options?.magnification == enabled else { return }
+        pendingMagnification = (enabled, size)
+        guard magnificationWrite == nil || finished else { return }
+        magnificationWrite?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.magnificationWrite = nil
+            guard let pending = self.pendingMagnification, self.canAdjustHiddenDock else { return }
+            self.pendingMagnification = nil
+            CoreDockMagnification.set(enabled: pending.enabled, size: pending.size)
+            CoreDockAutoHide.set(true)
+        }
+        magnificationWrite = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (finished ? 0 : 0.1), execute: work)
+    }
+    private var pendingMagnification: (enabled: Bool, size: Double)?
+    private var magnificationWrite: DispatchWorkItem?
 
     private func showManager(selectedID: UUID? = nil) { manager.show(groups: store.configuration.groups, status: status, selectedID: selectedID) }
     private func quit() { NSApp.terminate(nil) }

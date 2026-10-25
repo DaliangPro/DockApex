@@ -395,7 +395,7 @@ struct NativeDockTile: Equatable, Sendable {
     var title: String
 }
 
-/// 一块实时补底：窗口 + 屏幕捕捉流，只在内存中合成。补底、标签遮盖与原生菜单遮盖共用。
+/// 一块实时补底：窗口 + 屏幕捕捉流，只在内存中合成。补底与标签遮盖共用。
 @MainActor
 final class ShadowPatch {
     private let title: String
@@ -465,16 +465,14 @@ final class ShadowPatch {
         snapshotTask?.cancel(); snapshotTask = nil
     }
 
-    /// `existingWindowsOnly`：盖在应用栏之上的原生菜单遮盖。截应用栏、补底与其它窗口，但不截这块遮盖、
-    /// 系统 Dock 自己的窗口以及之后才出现的系统菜单（见下方过滤器的选择）。
     func show(rect: CGRect, screen: NSScreen, includeApps: Bool, interactive: Bool, framesPerSecond: Int32,
-              fullResolution: Bool = false, existingWindowsOnly: Bool = false) {
+              fullResolution: Bool = false) {
         let panel = self.panel ?? make()
         panel.ignoresMouseEvents = !interactive
         if panel.frame != rect { panel.setFrame(rect, display: false) }
         wantsVisible = true
         startStream(rect: rect, screen: screen, includeApps: includeApps, framesPerSecond: framesPerSecond,
-                    fullResolution: fullResolution, existingWindowsOnly: existingWindowsOnly)
+                    fullResolution: fullResolution)
         // 新流的第一帧到达前不上屏，避免露出纯色底。
         if hasFrame, !panel.isVisible { panel.orderFrontRegardless() }
     }
@@ -486,17 +484,7 @@ final class ShadowPatch {
         panel.orderOut(nil)
         if panel.frame != rect { panel.setFrame(rect, display: false) }
         startStream(rect: rect, screen: screen, includeApps: includeApps, framesPerSecond: framesPerSecond,
-                    fullResolution: fullResolution, existingWindowsOnly: false)
-    }
-
-    /// 等新流的第一帧上屏（遮盖真正盖住之后才能做被它遮住的事）。超时返回 false。
-    func waitForFirstFrame(timeout: TimeInterval) async -> Bool {
-        let start = ProcessInfo.processInfo.systemUptime
-        while ProcessInfo.processInfo.systemUptime - start < timeout {
-            if hasFrame, panel?.isVisible == true { return true }
-            try? await Task.sleep(for: .milliseconds(4))
-        }
-        return false
+                    fullResolution: fullResolution)
     }
 
     /// 在捕捉画面之上叠窗口阴影；`region` 与补底窗口同一块屏幕区域。窗口和区域都没变时不重画。
@@ -511,16 +499,6 @@ final class ShadowPatch {
         shadowLayer.frame = CGRect(origin: .zero, size: region.size)
         shadowLayer.contents = relevant.isEmpty ? nil
             : Self.shadowImage(WindowShadowRenderer.alphaMap(region: region, scale: Double(scale), casters: relevant, exclusions: exclusions))
-    }
-
-    /// 直接使用已算好的阴影图（调用方在后台线程算，避免大区域卡主线程）。
-    func setShadowMap(_ map: (width: Int, height: Int, alpha: [UInt8]), region: CGRect) {
-        guard let shadowLayer else { return }
-        shadowKey = nil
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        shadowLayer.frame = CGRect(origin: .zero, size: region.size)
-        shadowLayer.contents = map.alpha.contains(where: { $0 > 0 }) ? Self.shadowImage(map) : nil
-        CATransaction.commit()
     }
 
     /// 黑色 + 逐像素 alpha，第一行对应区域顶边。
@@ -575,14 +553,13 @@ final class ShadowPatch {
         return panel
     }
 
-    private func startStream(rect: CGRect, screen: NSScreen, includeApps: Bool, framesPerSecond: Int32,
-                             fullResolution: Bool, existingWindowsOnly: Bool) {
+    private func startStream(rect: CGRect, screen: NSScreen, includeApps: Bool, framesPerSecond: Int32, fullResolution: Bool) {
         guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return }
         let displayID = number.uint32Value
         // SCK 的源矩形以显示器左上为原点。
         let local = CGRect(x: rect.minX - screen.frame.minX, y: screen.frame.maxY - rect.maxY, width: rect.width, height: rect.height)
         // 帧率和分辨率也进入 key：悬停与预热切换参数时必须重建流，否则会沿用旧流。
-        let geometry = "\(displayID)|\(NSStringFromRect(local))|\(includeApps)|\(fullResolution)|\(existingWindowsOnly)"
+        let geometry = "\(displayID)|\(NSStringFromRect(local))|\(includeApps)|\(fullResolution)"
         let wanted = "\(geometry)|\(framesPerSecond)"
         includesApps = includeApps
         if key == wanted { return }
@@ -597,38 +574,12 @@ final class ShadowPatch {
         let screenColorSpaceName = screen.colorSpace?.cgColorSpace?.name
         let scale = fullResolution ? screen.backingScaleFactor : 1
         let ownPID = ProcessInfo.processInfo.processIdentifier
-        let selfWindowID = CGWindowID(panel?.windowNumber ?? 0)
         Task.detached(priority: .userInitiated) { [weak self] in
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
                 guard let display = content.displays.first(where: { $0.displayID == displayID }) else { return }
                 let filter: SCContentFilter
-                if existingWindowsOnly {
-                    let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
-                    // 画系统菜单的 DockHelper 按需启动：在运行时按应用排除（新流约 0.13 秒起来），
-                    // 不在运行时它随后画出的菜单会被截进遮盖，只能改为只截已有窗口（约 0.55 秒）。
-                    if let helper = content.applications.first(where: { $0.applicationName == "DockHelper" }) {
-                        let excludedApps = content.applications.filter { app in
-                            app.processID == ownPID || app.processID == helper.processID || app.bundleIdentifier.hasPrefix("com.apple.dock")
-                        }
-                        let kept = content.windows.filter { window in
-                            (window.owningApplication?.bundleIdentifier == "com.apple.dock" && window.windowLayer < dockLevel)
-                                || (window.owningApplication?.processID == ownPID && window.windowID != selfWindowID)
-                        }
-                        filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: kept)
-                    } else {
-                        let sourceGlobal = CGRect(x: local.minX + CGFloat(display.frame.minX), y: local.minY + CGFloat(display.frame.minY),
-                                                  width: local.width, height: local.height)
-                        let windows = content.windows.filter { window in
-                            let owner = window.owningApplication
-                            if window.windowID == selfWindowID || !window.frame.intersects(sourceGlobal) { return false }
-                            // 系统 Dock 只保留壁纸、桌面层；它自己的 Dock 窗口和菜单都不截。
-                            if owner?.bundleIdentifier == "com.apple.dock" { return window.windowLayer < dockLevel }
-                            return true
-                        }
-                        filter = SCContentFilter(display: display, including: windows)
-                    }
-                } else if includeApps {
+                if includeApps {
                     let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
                     // 按应用整体排除本应用、系统 Dock 与 DockHelper（名称标签、菜单）——包括之后才出现的窗口；
                     // 只按当时可见窗口排除会把后来出现的遮盖层和标签拍进画面，形成自我叠加的残影。
@@ -658,11 +609,16 @@ final class ShadowPatch {
                 configuration.pixelFormat = kCVPixelFormatType_32BGRA
                 if let name = screenColorSpaceName { configuration.colorSpaceName = name }
                 if let snapshotInterval {
-                    let task = Task { @MainActor [weak self] in
+                    // 截图不在主线程上做：截图接口每个进程第一次用时，会在调用线程上初始化音频（约 0.2 秒），只有换画面回主线程。
+                    let task = Task.detached(priority: .userInitiated) { [weak self] in
                         while !Task.isCancelled {
                             if let image = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) {
-                                guard let self, self.key == wanted, !Task.isCancelled else { return }
-                                self.receive(image, key: wanted)
+                                let current = await MainActor.run { [weak self] () -> Bool in
+                                    guard let self, self.key == wanted else { return false }
+                                    self.receive(image, key: wanted)
+                                    return true
+                                }
+                                guard current, !Task.isCancelled else { return }
                             }
                             try? await Task.sleep(for: .seconds(snapshotInterval))
                         }

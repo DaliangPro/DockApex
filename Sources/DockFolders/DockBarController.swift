@@ -1288,17 +1288,7 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
     /// 松开建组后拖动图标正飞入目标格；期间布局保持进入目标时冻结的样子。
     private var mergeCommit: (source: String, target: String)?
 
-    /// 弹出菜单前的异步准备（读取 App 原生 Dock 菜单）；由应用控制器设置。
-    static var prepareMenu: ((String, @escaping @MainActor () -> Void) -> Void)?
-
-    func showMenu(for id: String) {
-        guard let prepare = Self.prepareMenu else { presentMenu(for: id); return }
-        onHold?("menu-prepare", true)
-        prepare(id) { [weak self] in
-            self?.onHold?("menu-prepare", false)
-            self?.presentMenu(for: id)
-        }
-    }
+    func showMenu(for id: String) { presentMenu(for: id) }
 
     /// 与原生 Dock 一致：菜单出现在图标外侧（底部 Dock 时在图标上方），用系统弹出框承载，箭头指向图标。
     /// 含子菜单的菜单（栏空白处的设置）仍用系统菜单，出现在图标上方、左右居中。

@@ -30,7 +30,7 @@ struct NativeDockSettingsWatcherChecks {
         defaults(["write", domain, "magnification", "-bool", "false"])
         defaults(["write", domain, "largesize", "-int", "64"])
         let recorder = Recorder()
-        let watcher = NativeDockSettingsWatcher(path: domain + ".plist") { recorder.add($0) }
+        let watcher = NativeDockSettingsWatcher(path: domain + ".plist", readsDock: false) { recorder.add($0) }
         watcher.start()
         var checks = 0
         precondition(wait(recorder, count: 1), "启动后应先回调一次当前值")
@@ -50,6 +50,10 @@ struct NativeDockSettingsWatcherChecks {
         defaults(["write", domain, "show-process-indicators", "-bool", "false"])
         precondition(wait(recorder, count: before + 1), "文件被整份替换后仍应继续监视")
         precondition(recorder.lastValue?.showRunningIndicators == false, "运行指示应跟随")
+        checks += 2
+        defaults(["write", domain, "tilesize", "-float", "35"])
+        precondition(wait(recorder, count: before + 2), "改了图标尺寸后应回调")
+        precondition(recorder.lastValue?.tileSize == 35, "回调里应带上图标尺寸")
         checks += 2
         print("checksPassed \(checks)")
     }

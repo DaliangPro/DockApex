@@ -39,14 +39,14 @@ The bar has three sections separated by dividers: on the left, pinned apps and f
 - Magnification on hover, name labels, running indicators, launch bounce and unread badges, just like the system Dock.
 - Icons darken when pressed, as in the native Dock; when an app can't be found, its icon shows the native Dock's gray question mark.
 - When an app draws its Dock icon with its own Dock tile plug-in (for example after you change its icon inside the app), the bar shows that icon too.
-- Magnification (and its size), running indicators, launch animation and whether windows minimize into the application icon follow the options in System Settings › Desktop & Dock: change them there and the bar follows (except with the shadow Dock). DockApex's menu has no separate switches for them.
+- Size, magnification (and its size), running indicators, launch animation and whether windows minimize into the application icon follow the options in System Settings › Desktop & Dock: change them there and the bar follows (except with the shadow Dock). While you drag the Size slider the bar's icons follow; after you let go the slider jumps back to a smaller position, because DockApex uses the hidden system Dock to aim minimized windows at the bar. You can also drag the Dock Size and Hover Magnification sliders in DockApex's settings menu (see below).
 
 ### Clicks and menus
 
 - **Click an app**: opens it if it isn't running, switches to it if it is; if all its windows are minimized, one of them is restored.
 - **Modifier clicks**: ⌘-click shows the item in Finder (file and folder items too); ⌥-click the current app to hide it, or another app to switch to it and hide the previous one; ⌘⌥-click switches to the app and hides all others.
 - **Open a menu**: right-click, Control-click, or press and hold for about half a second. Keep holding, drag onto a menu item and release to choose it.
-- **An app's right-click menu**: Open / Switch, its current windows (◆ marks minimized ones, ✓ the current one), the app's own Dock menu items (such as Finder's New Finder Window), Options, Show All Windows, Show in Finder, Keep in bar or Remove from bar, Hide, Quit, Force Quit (with a confirmation). Finder stays first and can't be removed or quit.
+- **An app's right-click menu**: Open / Switch, its current windows (◆ marks minimized ones, ✓ the current one), Show in Finder, Keep in bar or Remove from bar, Hide, Quit, Force Quit (with a confirmation). Finder stays first and can't be removed or quit.
 
 ### Window previews
 
@@ -89,7 +89,7 @@ Right-click an empty part of the bar, or click the four-squares icon in the menu
 - Display: main display; all displays (one bar per display); follow the pointer (push the pointer against the edge of another display for about 0.35 seconds and the bar moves there); or a specific display (if it's disconnected, the bar falls back to the main display and returns when it's reconnected)
 - Auto-hide: move the pointer to the screen edge to reveal it. The bar on a display also hides automatically while an app is full screen there
 - Show recent apps: up to 3; turn it off and unpinned apps disappear from the bar when they quit
-- Icon size: 28, 37, 48 or 64 points
+- Dock size and hover magnification: two sliders, and the bar follows while you drag. Dock Size is how big icons normally are; Hover Magnification is how big an icon grows when the pointer rests on it. All the way left turns magnification off, and it also changes the Magnification setting in System Settings
 - Open at login (登录时打开): start DockApex when you log in
 
 ### Keyboard and accessibility
@@ -104,7 +104,6 @@ Right-click an empty part of the bar, or click the four-squares icon in the menu
 - The data folder also holds an activity log (recording things like the names of apps you opened or switched to and folder names; it rolls over at about 5 MB and keeps 3 files) and a daily layout backup (7 kept), all local.
 - In everyday use, Screen Recording is used only for the following, and images stay in memory, never written to disk or uploaded:
   - Window previews: only while you hover, that app's windows are captured one by one as small thumbnails; each is dropped when its window closes or the app quits, and everything is cleared once there are more than 64.
-  - Reading an app's own Dock menu items: on right-click, a live image covers the area where the menu would appear for about a second, so the system menu doesn't flash; it also covers it briefly when you run one of those items.
   - The optional shadow Dock: painting the backdrop under the bar.
 - An app's own Dock tile plug-in runs in a separate helper process that doesn't get DockApex's Accessibility or Screen Recording permissions.
 
@@ -136,7 +135,7 @@ Turn these on in System Settings › Privacy & Security. DockApex doesn't remind
 | Permission | Used for |
 | --- | --- |
 | Accessibility | Keeping windows clear of the bar, moving floating bars, listing and switching windows, unread badges, detecting full screen, menus |
-| Screen Recording | Window previews; reading apps' own Dock menu items (Accessibility is needed too); the optional shadow Dock |
+| Screen Recording | Window previews; the optional shadow Dock |
 | Automation › Finder | Emptying the Trash; asked the first time you use it |
 
 ### 4. Quit, update and uninstall
@@ -213,7 +212,6 @@ Restart the app for the change to take effect.
 
 - Only one display can have a system-reserved area; in “all displays” mode the others rely on window adjustment.
 - Apps that are already running can't see the bar's reserved space, so their windows are corrected after the fact and may briefly overlap the bar.
-- The first time you right-click an app, reading its own Dock menu items takes about a second; after that a cache is used for 10 minutes.
 - Window previews and right-click menus without submenus use the system popover (menus with submenus use a regular system menu). Measured on a 5K display, each time the popover appears at a new position or size the system briefly takes about 250 MB of graphics memory, released after about a second.
 - Some custom Dock tiles and full-screen / Spaces combinations aren't fully covered yet.
 

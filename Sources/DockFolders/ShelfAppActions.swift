@@ -186,20 +186,9 @@ enum ShelfAppActions {
         let menu = ShelfApplicationMenu(application: app, onWindowSelected: onActivate)
         menu.addItem(ShelfMenuItem("打开 / 切换") { open(app); onActivate?() })
         let target = running(app)
-        let mirrored = target.flatMap { NativeDockMenuMirror.shared.cached(for: $0.processIdentifier) }
-        if target != nil {
-            // 常用窗口直接出现在当前菜单，菜单打开后的 AX 更新也在原处补全。
-            menu.installCachedWindows()
-            if let custom = mirrored?.custom, !custom.isEmpty {
-                menu.addItem(.separator())
-                for entry in custom { menu.addItem(mirroredItem(entry, app: app, path: [])) }
-            }
-        }
+        // 常用窗口直接出现在当前菜单，菜单打开后的 AX 更新也在原处补全。
+        if target != nil { menu.installCachedWindows() }
         menu.addItem(.separator())
-        if let mirrored {
-            if let options = mirrored.options { menu.addItem(mirroredItem(options, app: app, path: [])) }
-            if let showAll = mirrored.showAllWindows { menu.addItem(mirroredItem(showAll, app: app, path: [])) }
-        }
         menu.addItem(ShelfMenuItem("在 Finder 中显示") { NSWorkspace.shared.activateFileViewerSelecting([app.appURL]) })
         for item in extraItems { menu.addItem(item) }
         if allowRemoval, let onRemove { menu.addItem(ShelfMenuItem("从应用栏移除", handler: onRemove)) }
@@ -230,23 +219,6 @@ enum ShelfAppActions {
             }
         }
         return menu
-    }
-
-    /// 原生 Dock 菜单项的镜像；选中后在遮盖下由系统 Dock 执行同一项。
-    private static func mirroredItem(_ entry: NativeDockMenuEntry, app: AppReference, path: [String]) -> NSMenuItem {
-        if entry.isSeparator { return .separator() }
-        let fullPath = path + [entry.title]
-        if !entry.children.isEmpty {
-            let item = NSMenuItem(title: entry.title, action: nil, keyEquivalent: "")
-            let submenu = NSMenu(title: entry.title)
-            for child in entry.children { submenu.addItem(mirroredItem(child, app: app, path: fullPath)) }
-            item.submenu = submenu
-            return item
-        }
-        let item = ShelfMenuItem(entry.title) { NativeDockMenuMirror.shared.perform(app, path: fullPath) }
-        item.isEnabled = entry.enabled
-        item.state = entry.checked ? .on : .off
-        return item
     }
 
     static func showError(title: String, message: String) {
@@ -296,6 +268,43 @@ enum ShelfAppActions {
 }
 
 @MainActor
+/// 菜单里的一行滑块：左边标题、右边滑块，拖动时连续回调，松手时 finished 为 true。
+/// 设置菜单用它调应用栏的大小与放大，对应系统设置里程序坞的两个滑块。
+final class ShelfMenuSlider: NSView {
+    let slider: NSSlider
+    private let handler: (Double, Bool) -> Void
+
+    init(title: String, value: Double, range: ClosedRange<Double>, handler: @escaping (Double, Bool) -> Void) {
+        self.handler = handler
+        slider = NSSlider(value: value, minValue: range.lowerBound, maxValue: range.upperBound, target: nil, action: nil)
+        super.init(frame: NSRect(x: 0, y: 0, width: 280, height: 28))
+        let label = NSTextField(labelWithString: title)
+        label.font = .menuFont(ofSize: 0)
+        slider.isContinuous = true
+        slider.controlSize = .small
+        slider.target = self
+        slider.action = #selector(changed)
+        slider.setAccessibilityLabel(title)
+        for view in [label, slider] as [NSView] { view.translatesAutoresizingMaskIntoConstraints = false; addSubview(view) }
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            // 标题栏宽按四个字留足，两行的滑块左端对齐。
+            slider.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 92),
+            slider.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            slider.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { nil }
+
+    func update(value: Double, range: ClosedRange<Double>) {
+        slider.minValue = range.lowerBound; slider.maxValue = range.upperBound
+        slider.doubleValue = value
+    }
+
+    @objc private func changed() { handler(slider.doubleValue, NSApp.currentEvent?.type == .leftMouseUp) }
+}
+
 final class ShelfMenuItem: NSMenuItem {
     private let handler: () -> Void
     init(_ title: String, key: String = "", handler: @escaping () -> Void) {

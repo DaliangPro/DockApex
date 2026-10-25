@@ -566,6 +566,25 @@ final class NativeDockCoordinator {
         }
     }
 
+    /// 用户在系统设置里改了受管键（经典模式下拖“大小”滑块）：退出或崩溃时写回的原值换成用户新选的值，
+    /// 系统 Dock 恢复后就是用户最后选的大小，而不是进入时的旧值。
+    func updateOriginal(_ key: String, to value: Any) throws {
+        guard let sessionID else { return }
+        try NativeDockRecovery.withLock(at: location) {
+            let session = try NativeDockRecovery.load(location.state)
+            guard session.id == sessionID, session.phase == .active, NativeDockRecovery.isManaged(key, in: session),
+                  session.changes.contains(where: { $0.key == key }) else { return }
+            let original = try NativeDockPreferenceValue.encoding(value)
+            let changes = session.changes.map { $0.key == key ? NativeDockPreferenceChange(key: key, original: original, applied: $0.applied) : $0 }
+            try NativeDockRecovery.save(NativeDockRecoverySession(version: session.version, id: session.id, mainPID: session.mainPID,
+                                                                  mainIdentity: session.mainIdentity, userID: session.userID,
+                                                                  createdAt: session.createdAt, changes: changes, phase: session.phase,
+                                                                  attemptedKeys: session.attemptedKeys, restoredKeys: session.restoredKeys,
+                                                                  preservedKeys: session.preservedKeys, finishedAt: session.finishedAt),
+                                        at: location.state)
+        }
+    }
+
     /// 屏幕捕获失效时立即归还原生动画；隐藏会话仍然有效，watchdog 仍能恢复其余字段。
     func resumeNativeMinimizationAnimations() throws {
         guard let sessionID else { return }
