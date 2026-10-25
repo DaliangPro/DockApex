@@ -776,8 +776,10 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
     private var reportedHover: String?
     private var activeGroupID: String?
     private var activeGroupSnapshot: DockMotionSnapshot?
-    /// 静止布局按哪个尺寸算的。应用栏窗口随条目增减逐帧改尺寸，旧尺寸里算出的位置会让图标偏离面板。
+    /// 锁定布局按哪个尺寸算的。应用栏窗口随条目增减逐帧改尺寸，旧尺寸里算出的位置会让图标偏离面板。
     private var activeGroupBounds = CGRect.zero
+    /// 分组展开时冻结的放大状态：放大量，以及指针相对该图标静止中心的位置。
+    private var groupMagnification: (id: String, amount: CGFloat, offset: CGPoint?)?
     private var pressedID: String?
     private var pressedPointer: CGPoint?
     private var magnifyAmount: CGFloat = 0
@@ -805,7 +807,7 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
     private weak var forwardedMenuDelegate: NSMenuDelegate?
     private var menuID: String?
     private var menuSnapshot: DockMotionSnapshot?
-    private var menuClosedAt: TimeInterval?
+    private var layoutReleasedAt: TimeInterval?
     private var dragSizes: [String: CGFloat] = [:]
     private var mergeSnapshot: DockMotionSnapshot?
     private var overlayState = DockMotionOverlayState()
@@ -855,8 +857,8 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
             if item.isRunning { launching.removeValue(forKey: item.id) }
         }
         setAccessibilityChildren(items.compactMap { icons[$0.id] })
-        // 展开期间条目变化（如有应用启动）时，按新条目重算静止布局，面板仍对准文件夹。
-        if activeGroupID != nil, activeGroupSnapshot != nil { lockRestingLayout() }
+        // 展开期间条目变化（如有应用启动）时，按新条目重算锁定的布局，面板仍对准文件夹。
+        if activeGroupID != nil, activeGroupSnapshot != nil { lockGroupLayout() }
         if presented.isEmpty { installSnapshot(pointer: nil, fraction: 1, time: ProcessInfo.processInfo.systemUptime) }
         if overlay.frame != bounds { overlay.frame = bounds }
         updateOverlay()
@@ -957,24 +959,22 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
         }
         // 原生实测：栏内位置立即跟手；放大程度在移入时约 120ms、移出时约 110ms 内缓入缓出。
         let reduce = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        // 分组展开期间布局锁定在未放大的静止快照：放大量同步回落，收起后再从未放大缓入，两头都不硬切。
+        // 分组展开期间布局锁定在点击那一刻的放大快照（与右键菜单一致）；锁定的布局变了（如条目增减）就平滑过去。
         let groupSettling = activeGroupSnapshot != nil && !isDragging
-        let target: CGFloat = magnificationPointer != nil && !groupSettling ? 1 : 0
+        let target: CGFloat = magnificationPointer != nil ? 1 : 0
         if let magnificationPointer { lastMagnificationPointer = magnificationPointer }
-        // 菜单开着时放大量与布局一起冻结。否则指针移到菜单上时放大量照常衰减，关菜单那一帧布局按衰减后的放大量重算，
+        // 菜单开着、分组展开时放大量与布局一起冻结。否则指针移到菜单上时放大量照常衰减，关菜单那一帧布局按衰减后的放大量重算，
         // 图标先猛地缩小再长回来，看起来一闪（10-23 逐帧实测关菜单一帧内 62 → 57 点）。
-        if menuSnapshot != nil {}
+        if menuSnapshot != nil || activeGroupSnapshot != nil {}
         else if reduce { magnifyAmount = target }
         else if target > magnifyAmount { magnifyAmount = min(1, magnifyAmount + CGFloat(delta / 0.12)) }
         else if target < magnifyAmount { magnifyAmount = max(0, magnifyAmount - CGFloat(delta / 0.11)) }
-        let eased = magnifyAmount * magnifyAmount * (3 - 2 * magnifyAmount)
-        var effective = metrics
-        effective.maximumIconSize = metrics.iconSize + (metrics.maximumIconSize - metrics.iconSize) * eased
+        let effective = magnifiedMetrics(magnifyAmount)
         let magnifying = magnifyAmount > 0 && !isDragging
-        // 关菜单后约 0.2 秒内从冻结的布局缓到当前目标（与指针移出栏时同样的缓动），不在一帧里跳过去；之后恢复放大即时跟手。
-        let easingOutOfMenu = menuClosedAt.map { interactionTime - $0 < 0.2 } ?? false
-        if !easingOutOfMenu { menuClosedAt = nil }
-        let fraction: CGFloat = reduce || (!easingOutOfMenu && !groupSettling && (magnifying || target == 1)) ? 1 : CGFloat(1 - exp(-delta / 0.045))
+        // 关菜单、收起分组后约 0.2 秒内从冻结的布局缓到当前目标（与指针移出栏时同样的缓动），不在一帧里跳过去；之后恢复放大即时跟手。
+        let easingOutOfFreeze = layoutReleasedAt.map { interactionTime - $0 < 0.2 } ?? false
+        if !easingOutOfFreeze { layoutReleasedAt = nil }
+        let fraction: CGFloat = reduce || (!easingOutOfFreeze && !groupSettling && (magnifying || target == 1)) ? 1 : CGFloat(1 - exp(-delta / 0.045))
         let geometryMoving = installSnapshot(pointer: magnifying ? lastMagnificationPointer : nil, fraction: fraction, time: time,
                                              metrics: magnifying ? effective : metrics)
             || (magnifyAmount > 0 && magnifyAmount < 1)
@@ -1005,13 +1005,13 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
 
     @discardableResult
     private func installSnapshot(pointer: CGPoint?, fraction: CGFloat, time: TimeInterval, metrics override: DockMotionMetrics? = nil) -> Bool {
-        if activeGroupSnapshot != nil, activeGroupBounds != bounds { lockRestingLayout() }
+        if activeGroupSnapshot != nil, activeGroupBounds != bounds { lockGroupLayout() }
         let retained = menuSnapshot ?? mergeSnapshot ?? (isDragging ? nil : activeGroupSnapshot)
         let snapshot = DockMotionLayout.snapshot(
             items: motion, in: bounds, position: position, metrics: override ?? metrics,
             pointer: pointer, retainedSnapshot: retained,
             draggedID: sourceID, insertionGap: dragGap, preservedSizes: dragSizes)
-        // 菜单与合并快照需原地冻结；分组展开快照平滑回到静止布局。
+        // 菜单与合并快照需原地冻结；分组展开快照重算后（条目增减、拖动结束）平滑过去。
         let layoutFraction: CGFloat = retained == nil || (menuSnapshot == nil && mergeSnapshot == nil) ? fraction : 1
         var moving = false
         backdropRect = backdropRect.isEmpty ? snapshot.background : DockMotionLayout.interpolated(backdropRect, toward: snapshot.background, fraction: layoutFraction)
@@ -1051,17 +1051,40 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
         onOpen?(id, CGPoint(x: rect.midX, y: primaryHeight - rect.midY))
     }
 
-    func releaseActiveGroup() { activeGroupID = nil; activeGroupSnapshot = nil; onNeedsFrames?() }
-    /// 展开期间锁定为未放大的静止布局：文件夹图标回到正常尺寸，面板对准静止位置。
+    func releaseActiveGroup() {
+        if activeGroupSnapshot != nil { layoutReleasedAt = ProcessInfo.processInfo.systemUptime }
+        activeGroupID = nil; activeGroupSnapshot = nil; groupMagnification = nil; onNeedsFrames?()
+    }
+    /// 展开期间与右键菜单一样停在点击那一刻的放大状态，面板对准放大后的图标（与菜单从同一处弹出）；收起后再跟手。
     func retainGroupAnchor(_ id: String) {
         activeGroupID = id
-        lockRestingLayout()
+        // 同一次展开会进来两次（应用栏与应用控制器各一次），只在换了分组时重新记录放大状态。
+        if groupMagnification?.id != id {
+            let resting = DockMotionLayout.snapshot(items: motion, in: bounds, position: position, metrics: metrics, pointer: nil).frames[id]
+            let offset = lastMagnificationPointer.flatMap { point in resting.map { CGPoint(x: point.x - $0.midX, y: point.y - $0.midY) } }
+            groupMagnification = (id, isDragging ? 0 : magnifyAmount, offset)
+        }
+        lockGroupLayout()
         layoutFrames = presented
         onNeedsFrames?()
     }
-    private func lockRestingLayout() {
-        activeGroupSnapshot = DockMotionLayout.snapshot(items: motion, in: bounds, position: position, metrics: metrics, pointer: nil)
+    /// 按冻结的放大量与指针相对图标的位置重算：应用栏条目或尺寸变了，放大中心仍落在展开的这个图标上。
+    private func lockGroupLayout() {
+        var locked = metrics
+        var pointer: CGPoint?
+        if let frozen = groupMagnification, frozen.amount > 0, let offset = frozen.offset,
+           let resting = DockMotionLayout.snapshot(items: motion, in: bounds, position: position, metrics: metrics, pointer: nil).frames[frozen.id] {
+            locked = magnifiedMetrics(frozen.amount)
+            pointer = CGPoint(x: resting.midX + offset.x, y: resting.midY + offset.y)
+        }
+        activeGroupSnapshot = DockMotionLayout.snapshot(items: motion, in: bounds, position: position, metrics: locked, pointer: pointer)
         activeGroupBounds = bounds
+    }
+    private func magnifiedMetrics(_ amount: CGFloat) -> DockMotionMetrics {
+        let eased = amount * amount * (3 - 2 * amount)
+        var magnified = metrics
+        magnified.maximumIconSize = metrics.iconSize + (metrics.maximumIconSize - metrics.iconSize) * eased
+        return magnified
     }
     func press(_ id: String, point: CGPoint) { pressedID = id; pressedPointer = point; onNeedsFrames?() }
     func releasePress() { pressedID = nil; pressedPointer = nil; onNeedsFrames?() }
@@ -1321,7 +1344,7 @@ final class DockMotionSurface: NSView, NSMenuDelegate {
         forwardedMenuDelegate?.menuDidClose?(menu)
         forwardedMenuDelegate = nil
         observedMenu = nil; menuID = nil; menuSnapshot = nil
-        menuClosedAt = ProcessInfo.processInfo.systemUptime
+        layoutReleasedAt = ProcessInfo.processInfo.systemUptime
         onHold?("menu", false)
         onNeedsFrames?()
     }
