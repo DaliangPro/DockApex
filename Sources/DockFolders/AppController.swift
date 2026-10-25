@@ -28,6 +28,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastTrashIsEmpty: Bool?
     private var emptyingTrash = false
     private var runtimeObservers: [NSObjectProtocol] = []
+    private var dockSettings: NativeDockSettingsWatcher?
     private lazy var fullscreenTracker = FullscreenTracker { [weak self] displays in
         self?.bar.setFullscreenDisplays(displays)
         self?.shadowDock.setFullscreenDisplays(displays)
@@ -238,6 +239,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             floatingAvoidance.onWindowEvent = { [weak self] in self?.workArea.requestWindowUpdate() }
             floatingAvoidance.startObserving()
             installRuntimeObservers()
+            dockSettings = NativeDockSettingsWatcher { [weak self] values in
+                Task { @MainActor [weak self] in self?.followNativeSettings(values) }
+            }
+            dockSettings?.start()
             ShelfRunningApplications.shared.onRegularTerminated = { [weak self] app in self?.rememberRecentApplication(app) }
             ShelfRunningApplications.shared.onChange = { [weak self] in
                 guard let self, !self.isEnding, self.terminationTask == nil else { return }
@@ -436,6 +441,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                             minimizeToApplication: (preference("minimize-to-application") as? Bool) ?? false)
     }
 
+    /// 系统设置里改了程序坞的放大、运行指示、启动动画或最小化方式：经典模式下应用栏跟着变，这几项本应用菜单里没有开关。
+    /// 影子 Dock 会改写放大、退出时又写回原值，那些时候不跟随。不算一步可撤销的布局更改。
+    private func followNativeSettings(_ values: NativeDockSettingsWatcher.Values) {
+        guard let store, !usesNativeHost, canAdjustHiddenDock else { return }
+        var next = store.configuration
+        var options = next.options ?? nativeOptions()
+        let before = options
+        options.magnification = values.magnification
+        options.maximumIconSize = max(values.largeSize, options.iconSize)
+        options.showRunningIndicators = values.showRunningIndicators
+        options.animateLaunching = values.animateLaunching
+        // 没存过（nil）与关等价，不为它多存一次。
+        if (before.minimizeToApplication == true) != values.minimizeToApplication { options.minimizeToApplication = values.minimizeToApplication }
+        guard options != before else { return }
+        next.options = options
+        do { try store.save(next, recordUndo: false) } catch { log?.record("跟随系统设置失败：\(error.localizedDescription)"); return }
+        func onOff(_ value: Bool) -> String { value ? "开" : "关" }
+        log?.record("系统设置里的程序坞选项变了，应用栏已跟随：放大 \(onOff(options.magnification))（\(Int(options.maximumIconSize)) 点）、"
+            + "运行指示 \(onOff(options.showRunningIndicators))、启动动画 \(onOff(options.animateLaunching))、"
+            + "最小化到应用程序图标 \(onOff(options.minimizeToApplication == true))")
+        refreshBar()
+    }
+
     private func nativeFiles() -> [ShelfFile] {
         let tiles = CFPreferencesCopyAppValue("persistent-others" as CFString, "com.apple.dock" as CFString) as? [[String: Any]] ?? []
         return tiles.compactMap { tile in
@@ -458,6 +486,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             forName: Notification.Name("io.daliang.dockfolders.sweep-benchmark"), object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.bar.runSweepBenchmark(duration: 3) }
         })
+        // 分组图标先用了旧图（成员还没按当前外观预取好）时，预取完再刷新一次，换上新图。
+        DockIconProvider.shared.onGroupIconsWarmed = { [weak self] in self?.refreshBar() }
         // 分组图标是按外观画好的位图，切换深浅色后重新取一次（通知早于外观生效，稍等再刷新）。
         runtimeObservers.append(DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("AppleInterfaceThemeChangedNotification"), object: nil, queue: .main) { [weak self] _ in

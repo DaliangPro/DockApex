@@ -1511,6 +1511,8 @@ final class DockMotionIcon: NSView {
     private var iconBitmap: CGImage?
     private var pressedBitmap: CGImage?
     private var rasterizedIcon: NSImage?
+    /// iconBitmap 是按哪个外观键画的（DockIconProvider.appearanceKey）。
+    private var rasterizedAppearance: String?
     private let badgeView = DockBadgeView()
     var badgeSuppressed = false {
         didSet {
@@ -1554,6 +1556,7 @@ final class DockMotionIcon: NSView {
                     hints: [.interpolation: NSImageInterpolation.high])
             }
             rasterizedIcon = item.icon
+            rasterizedAppearance = DockIconProvider.appearanceKey(effectiveAppearance)
             pressedBitmap = nil
             mergePreview.targetImage = iconBitmap
             needsDisplay = true
@@ -1568,11 +1571,18 @@ final class DockMotionIcon: NSView {
 
     var bitmap: CGImage? { iconBitmap }
 
-    /// 系统切换深浅色：位图是按旧外观画的，重画一次。
+    /// 系统切换深浅色或图标样式：位图是按旧外观画的，重画一次。菜单栏外观随壁纸明暗变化时 AppKit 也会通知这里，
+    /// 但应用栏的外观没变，不用重画（10-24 16:39 那次所有图标连着重取，卡了 0.86 秒）。
+    /// 重画前先让图标服务在后台按新外观生成好，期间保留旧位图。
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        iconBitmap = nil
-        update(item)
+        guard DockIconProvider.appearanceKey(effectiveAppearance) != rasterizedAppearance else { return }
+        let icon = item.icon
+        DockIconProvider.shared.whenWarm(icon, appearance: effectiveAppearance) { [weak self] in
+            guard let self, self.item.icon === icon else { return }
+            self.iconBitmap = nil
+            self.update(self.item)
+        }
     }
     /// 拖动图标落入的位置（图标坐标）。
     var mergeLandingRect: CGRect { mergePreview.landingRect }

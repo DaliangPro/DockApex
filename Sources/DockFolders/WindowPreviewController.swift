@@ -176,11 +176,13 @@ final class WindowPreviewController: NSObject, NSPopoverDelegate {
     }
 
     /// 后台逐个截取窗口，含最小化的（单窗口截取，不含阴影，长边 480 像素），截到一张就换上一张。
+    /// 截取不在主线程上做：截图接口每个进程第一次用时，会在调用线程上新建音频时钟、初始化 CoreAudio，
+    /// 放在主线程会让每次启动后第一次悬停卡约 0.2 秒（10-24 卡顿栈里 16 个进程各 1 次）。只有换缩略图回主线程。
     private func capture(_ windows: [AppWindowInfo], pid: pid_t, token: Int) {
         captureTask?.cancel()
         let targets = windows.compactMap { info in info.cgWindowID.map { (number: $0, frame: info.quartzFrame) } }
         guard !targets.isEmpty else { return }
-        captureTask = Task { [weak self] in
+        captureTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let content = try? await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false) else { return }
             for target in targets {
                 guard !Task.isCancelled else { return }
@@ -194,15 +196,19 @@ final class WindowPreviewController: NSObject, NSPopoverDelegate {
                 configuration.ignoreShadowsSingleWindow = true; configuration.shouldBeOpaque = false
                 guard let image = try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: window),
                                                                               configuration: configuration),
-                      Self.hasVisiblePixels(image), let self, !Task.isCancelled else { continue }
-                self.thumbnails[target.number] = (pid, image)
-                if self.generation == token { self.grid?.setThumbnail(image, for: target.number) }
+                      Self.hasVisiblePixels(image), !Task.isCancelled else { continue }
+                await self?.store(image, for: target.number, pid: pid, token: token)
             }
         }
     }
 
+    private func store(_ image: CGImage, for number: CGWindowID, pid: pid_t, token: Int) {
+        thumbnails[number] = (pid, image)
+        if generation == token { grid?.setThumbnail(image, for: number) }
+    }
+
     /// 缩到 8×8 看有没有不透明的点。
-    private static func hasVisiblePixels(_ image: CGImage) -> Bool {
+    nonisolated private static func hasVisiblePixels(_ image: CGImage) -> Bool {
         var pixels = [UInt8](repeating: 0, count: 8 * 8 * 4)
         return pixels.withUnsafeMutableBytes { buffer in
             guard let context = CGContext(data: buffer.baseAddress, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 32,

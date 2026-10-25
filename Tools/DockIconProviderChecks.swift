@@ -60,6 +60,38 @@ struct DockIconProviderChecks {
             }
             checks += 2
         }
+        // 外观键区分深浅色；后台预取完成后回调，同一外观再请求立即回调。
+        guard let aqua = NSAppearance(named: .aqua), let dark = NSAppearance(named: .darkAqua) else { fatalError("缺少系统外观") }
+        precondition(DockIconProvider.appearanceKey(aqua) != DockIconProvider.appearanceKey(dark), "深浅色的外观键应不同")
+        checks += 1
+        func spin(until done: () -> Bool) {
+            let deadline = Date().addingTimeInterval(15)
+            while !done(), Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+        }
+        if let first = apps.first {
+            let image = provider.icon(for: first)
+            var warmed = false
+            provider.whenWarm(image, appearance: dark) { warmed = true }
+            spin { warmed }
+            precondition(warmed, "后台预取完成后应回调")
+            var immediate = false
+            provider.whenWarm(image, appearance: dark) { immediate = true }
+            precondition(immediate, "已按该外观预取过应立即回调")
+            checks += 2
+        }
+        // 切换外观后成员还没按新外观预取好：先用旧图，预取完通知刷新，再取时换成新图。
+        let darkGroup = AppGroup(id: UUID(), name: "外观切换检查", apps: Array(apps.suffix(3)))
+        NSApp.appearance = aqua
+        let lightIcon = provider.groupIcon(for: darkGroup)
+        var refreshed = false
+        provider.onGroupIconsWarmed = { refreshed = true }
+        NSApp.appearance = dark
+        precondition(provider.groupIcon(for: darkGroup) === lightIcon, "成员未按新外观预取好时应先沿用旧图")
+        spin { refreshed }
+        precondition(refreshed, "成员预取完成后应通知刷新")
+        precondition(provider.groupIcon(for: darkGroup) !== lightIcon, "预取完成后应按新外观重画")
+        NSApp.appearance = nil
+        checks += 3
         let report: [String: Any] = ["checksPassed": checks, "applications": apps.count,
                                     "cachedRequests": apps.count * 1_000, "cachedMilliseconds": elapsed,
                                     "sourceLoads": provider.statistics.applicationSourceLoads,

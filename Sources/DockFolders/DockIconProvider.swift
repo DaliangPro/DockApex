@@ -23,18 +23,20 @@ final class DockIconProvider {
         let sourcePID: pid_t?
         var checkAfter: TimeInterval
         let fileSourceLoadedAt: TimeInterval
+        /// 已在后台按这些外观键预取过常用尺寸（见 prewarm）。
+        var warmedAppearances: Set<String> = []
     }
 
     private struct GroupEntry {
         let memberPaths: [String]
         let memberImages: [ObjectIdentifier]
-        let appearance: NSAppearance.Name?
+        let appearance: String
         let image: NSImage
     }
 
     private struct MinimizedEntry {
         let source: ObjectIdentifier
-        let appearance: NSAppearance.Name?
+        let appearance: String
         let image: NSImage
     }
 
@@ -47,6 +49,21 @@ final class DockIconProvider {
     private var groups: [UUID: GroupEntry] = [:]
     private var minimized: [String: MinimizedEntry] = [:]
     private(set) var statistics = Statistics()
+    /// 正在后台预取的应用（路径 → 外观键）和等预取完成的回调（按路径加外观键）。
+    private var warming: [String: String] = [:]
+    private var warmWaiters: [String: [@MainActor () -> Void]] = [:]
+    /// 有分组先用了旧图、等成员预取完再重画时置位；全部预取完后调用 onGroupIconsWarmed（由应用栏刷新）。
+    private var groupsAwaitingWarm = false
+    var onGroupIconsWarmed: (() -> Void)?
+
+    /// 图标随深浅色和系统的图标样式、着色设置变化；各缓存和预取都按这个键区分。
+    static func appearanceKey(_ appearance: NSAppearance) -> String {
+        let defaults = UserDefaults.standard
+        return [appearance.bestMatch(from: [.aqua, .darkAqua])?.rawValue ?? appearance.name.rawValue,
+                defaults.string(forKey: "AppleIconAppearanceTheme") ?? "",
+                defaults.string(forKey: "AppleIconAppearanceTintColor") ?? "",
+                defaults.string(forKey: "AppleIconAppearanceCustomTintColor") ?? ""].joined(separator: "|")
+    }
 
     func icon(for app: AppReference) -> NSImage {
         // App 自带 Dock 图标插件时用插件画出的图标，与原生 Dock 一致（用户在 App 里换过的图标只走这条路）。
@@ -59,6 +76,7 @@ final class DockIconProvider {
         let now = ProcessInfo.processInfo.systemUptime
         if let entry = applications[app.path], now < entry.checkAfter {
             statistics.applicationCacheHits += 1
+            prewarm(app.path)
             return entry.image
         }
         let running = ShelfRunningApplications.shared.running(app)
@@ -69,12 +87,14 @@ final class DockIconProvider {
                 entry.checkAfter = now + 1
                 applications[app.path] = entry
                 statistics.applicationCacheHits += 1
+                prewarm(app.path)
                 return entry.image
             }
             if runningImage == nil, entry.sourcePID == nil, now - entry.fileSourceLoadedAt < 30 {
                 entry.checkAfter = now + 1
                 applications[app.path] = entry
                 statistics.applicationCacheHits += 1
+                prewarm(app.path)
                 return entry.image
             }
         }
@@ -84,7 +104,54 @@ final class DockIconProvider {
         lastFound[app.path] = image
         statistics.applicationSourceLoads += 1
         trimApplicationsIfNeeded(keeping: app.path)
+        prewarm(app.path)
         return image
+    }
+
+    /// 系统图标在主线程上第一次按某个尺寸、外观画时，要同步等图标服务生成（10-24 卡顿栈 28 次，最长 0.86 秒）。
+    /// 图标服务生成后全系统共用缓存，所以在后台另取一份同一应用的图标、按常用尺寸画一遍，之后主线程再画只是取缓存
+    /// （实测未预取的首次最长 37 ms，预取后每个约 0.7 ms）。不碰调用方手里的图像对象，不跨线程共用同一个 NSImage。
+    private func prewarm(_ path: String, appearance: NSAppearance = NSApp.effectiveAppearance) {
+        let key = Self.appearanceKey(appearance)
+        guard applications[path]?.warmedAppearances.contains(key) != true, warming[path] != key else { return }
+        warming[path] = key
+        let name = appearance.bestMatch(from: [.aqua, .darkAqua, .accessibilityHighContrastAqua, .accessibilityHighContrastDarkAqua]) ?? .aqua
+        Task.detached(priority: .utility) { [weak self] in
+            Self.prepareSystemIcon(path: path, appearance: name)
+            await self?.finishWarm(path: path, key: key)
+        }
+    }
+
+    nonisolated private static func prepareSystemIcon(path: String, appearance name: NSAppearance.Name) {
+        guard let appearance = NSAppearance(named: name) else { return }
+        let image = NSWorkspace.shared.icon(forFile: path)
+        for points in [16, 32, 64, 128] as [CGFloat] {
+            _ = bitmapImage(size: NSSize(width: points, height: points), appearance: appearance) { rect in image.draw(in: rect) }
+        }
+    }
+
+    private func finishWarm(path: String, key: String) {
+        if warming[path] == key { warming[path] = nil }
+        if var entry = applications[path] { entry.warmedAppearances.insert(key); applications[path] = entry }
+        for waiter in warmWaiters.removeValue(forKey: path + "\n" + key) ?? [] { waiter() }
+        if groupsAwaitingWarm, warming.isEmpty {
+            groupsAwaitingWarm = false
+            onGroupIconsWarmed?()
+        }
+    }
+
+    private func isWarm(_ path: String, key: String) -> Bool {
+        DockTilePluginService.shared.image(for: path) != nil || broken[path] != nil || applications[path]?.warmedAppearances.contains(key) == true
+    }
+
+    /// 按某个外观重画图标前调用：图像是本缓存里的系统图标且还没按该外观预取过，就先在后台预取，完成后再回调；否则立即回调。
+    func whenWarm(_ image: NSImage, appearance: NSAppearance, then: @escaping @MainActor () -> Void) {
+        let key = Self.appearanceKey(appearance)
+        guard let path = applications.first(where: { $0.value.image === image })?.key, applications[path]?.warmedAppearances.contains(key) != true else {
+            then(); return
+        }
+        warmWaiters[path + "\n" + key, default: []].append(then)
+        prewarm(path, appearance: appearance)
     }
 
     private func brokenIcon(for app: AppReference) -> NSImage {
@@ -113,9 +180,15 @@ final class DockIconProvider {
         let paths = members.map(\.path)
         let identities = images.map(ObjectIdentifier.init)
         let appearance = NSApp.effectiveAppearance
-        let appearanceName = appearance.bestMatch(from: [.aqua, .darkAqua])
+        let appearanceName = Self.appearanceKey(appearance)
         if let entry = groups[group.id], entry.memberPaths == paths, entry.memberImages == identities, entry.appearance == appearanceName {
             statistics.groupCacheHits += 1
+            return entry.image
+        }
+        // 成员没变、只是外观或某个成员的图标换了，而成员还没按当前外观预取好时，先用旧图，预取完再由应用栏刷新重画，
+        // 免得在主线程上现等图标服务。成员增减、换顺序或第一次画时照常现画，图标要立即对上。
+        if let entry = groups[group.id], entry.memberPaths == paths, paths.contains(where: { !isWarm($0, key: appearanceName) }) {
+            groupsAwaitingWarm = true
             return entry.image
         }
         let memberCount = group.apps.count
@@ -144,7 +217,7 @@ final class DockIconProvider {
     func minimizedWindowIcon(for app: AppReference) -> NSImage {
         let source = icon(for: app)
         let appearance = NSApp.effectiveAppearance
-        let appearanceName = appearance.bestMatch(from: [.aqua, .darkAqua])
+        let appearanceName = Self.appearanceKey(appearance)
         if let entry = minimized[app.path], entry.source == ObjectIdentifier(source), entry.appearance == appearanceName { return entry.image }
         let image = Self.bitmapImage(size: NSSize(width: 128, height: 128), appearance: appearance) { rect in
             let frame = rect.insetBy(dx: 5, dy: 12)
@@ -160,7 +233,7 @@ final class DockIconProvider {
     }
 
     /// 按指定外观画成 2 倍像素的位图（128 点即 256 像素，够应用栏放大到最大尺寸）。
-    static func bitmapImage(size: NSSize, appearance: NSAppearance, draw: (NSRect) -> Void) -> NSImage {
+    nonisolated static func bitmapImage(size: NSSize, appearance: NSAppearance, draw: (NSRect) -> Void) -> NSImage {
         let image = NSImage(size: size)
         guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width * 2), pixelsHigh: Int(size.height * 2),
                                          bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,

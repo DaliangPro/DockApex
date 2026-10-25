@@ -39,7 +39,7 @@ The bar has three sections separated by dividers: on the left, pinned apps and f
 - Magnification on hover, name labels, running indicators, launch bounce and unread badges, just like the system Dock.
 - Icons darken when pressed, as in the native Dock; when an app can't be found, its icon shows the native Dock's gray question mark.
 - When an app draws its Dock icon with its own Dock tile plug-in (for example after you change its icon inside the app), the bar shows that icon too.
-- Magnification, running indicators, launch animation and whether windows minimize into the application icon are copied from the system Dock on first launch. Changing them in System Settings later doesn't affect the bar, and DockApex's menu has no switches for them.
+- Magnification (and its size), running indicators, launch animation and whether windows minimize into the application icon follow the options in System Settings › Desktop & Dock: change them there and the bar follows (except with the shadow Dock). DockApex's menu has no separate switches for them.
 
 ### Clicks and menus
 
@@ -66,7 +66,7 @@ Rest the pointer on a running app and thumbnails of its windows pop up, minimize
 ### Files, folders, minimized windows and the Trash
 
 - **Folder items**: click to list the contents, sorted by date modified by default or by name, up to 500 items. Click an item to open it; right-click to open it, show it in Finder, copy it or move it to the Trash; drag an item out; “Open in Finder” at the bottom opens the folder. Click a file item to open it.
-- **Minimized windows**: each minimized window gets a slot in the right section, shown as a window frame holding the app's icon. Click to restore and switch to it; right-click for Show Window and Open / Switch App. If the system Dock was set to minimize windows into the application icon on first launch, they aren't shown separately, same as the system.
+- **Minimized windows**: each minimized window gets a slot in the right section, shown as a window frame holding the app's icon. Click to restore and switch to it; right-click for Show Window and Open / Switch App. If System Settings is set to minimize windows into the application icon, they aren't shown separately, same as the system.
 - **Trash**: shows whether it's empty or full; click to open it; right-click to empty it. When Finder's “Show warning before emptying the Trash” is on, you're asked to confirm first.
 
 ### Apps that are uninstalled, moved or reinstalled

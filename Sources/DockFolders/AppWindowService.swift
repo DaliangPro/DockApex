@@ -87,14 +87,23 @@ struct AppWindowCacheEntry: Sendable {
     let processIdentity: String
 }
 
+/// 观察回调挂在主运行循环上。最小化、还原通知要向目标 App 同步取窗口号，对方正在做最小化动画时要等 0.1–0.4 秒
+/// （10-24 卡顿栈里 51 次都在这里），所以取号放到串行队列上做，按通知到达的顺序再转回主线程。
+private let appWindowNumberQueue = DispatchQueue(label: "io.daliang.dockfolders.window-number", qos: .userInitiated)
+private struct AppWindowElement: @unchecked Sendable { let element: AXUIElement }
+
 private let appWindowObserverCallback: AXObserverCallback = { _, element, notification, context in
     guard let context else { return }
     let pid = pid_t(Int(bitPattern: context))
     // context 只编码 PID，不解引用对象；注销后迟到的通知也不会访问已释放对象。
     let name = notification as String
     let windowID = "\(pid):\(CFHash(element))"
-    let number = name == kAXWindowMiniaturizedNotification || name == kAXWindowDeminiaturizedNotification ? AppWindowNumber.read(element) : nil
-    Task { @MainActor in AppWindowService.shared.receiveAccessibilityChange(processIdentifier: pid, notification: name, windowID: windowID, cgWindowID: number) }
+    let needsNumber = name == kAXWindowMiniaturizedNotification || name == kAXWindowDeminiaturizedNotification
+    let box = AppWindowElement(element: element)
+    appWindowNumberQueue.async {
+        let number = needsNumber ? AppWindowNumber.read(box.element) : nil
+        Task { @MainActor in AppWindowService.shared.receiveAccessibilityChange(processIdentifier: pid, notification: name, windowID: windowID, cgWindowID: number) }
+    }
 }
 
 actor AppWindowReader {
