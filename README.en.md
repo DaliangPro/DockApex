@@ -47,7 +47,12 @@ The bar has three sections separated by dividers: on the left, pinned apps and f
 - **Modifier clicks**: ⌘-click shows the item in Finder (file and folder items too); ⌥-click the current app to hide it, or another app to switch to it and hide the previous one; ⌘⌥-click switches to the app and hides all others.
 - **Open a menu**: right-click, Control-click, or press and hold for about half a second. Keep holding, drag onto a menu item and release to choose it.
 - **An app's right-click menu**: Open / Switch, its current windows (◆ marks minimized ones, ✓ the current one), the app's own Dock menu items (such as Finder's New Finder Window), Options, Show All Windows, Show in Finder, Keep in bar or Remove from bar, Hide, Quit, Force Quit (with a confirmation). Finder stays first and can't be removed or quit.
-- **Window previews**: rest the pointer on a running app and thumbnails of its windows pop up, minimized windows included with their real contents. Click a thumbnail to switch to that window (a minimized one is restored first), or × to close it. Works on the bar and inside folder panels.
+
+### Window previews
+
+![Window previews popping up over Tabbit; both windows are minimized](docs/images/preview.png)
+
+Rest the pointer on a running app and thumbnails of its windows pop up, minimized windows included with their real contents. Click a thumbnail to switch to that window (a minimized one is restored first), or × to close it. Works on the bar and inside folder panels.
 
 ### Drag and drop
 
